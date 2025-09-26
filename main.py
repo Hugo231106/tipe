@@ -698,40 +698,71 @@ class Checkbox(Widget):
 
 
 class Dropdown(Widget):
-    def __init__(self, rect: pygame.Rect, options: Sequence[str], value: str, font: pygame.font.Font):
+    def __init__(
+        self,
+        rect: pygame.Rect,
+        options: Sequence[str],
+        value: str,
+        font: pygame.font.Font,
+        on_change: Optional[Callable[[str], None]] = None,
+    ):
         super().__init__(rect)
         self.options = list(options)
         self.value = value
         self.open = False
         self.font = font
+        self.on_change = on_change
 
-    def handle_event(self, event: pygame.event.Event):
+    def handle_event(self, event: pygame.event.Event) -> bool:
         if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
             if self.open:
                 for i, option in enumerate(self.options):
-                    opt_rect = pygame.Rect(self.rect.x, self.rect.y + (i + 1) * self.rect.height, self.rect.width, self.rect.height)
+                    opt_rect = pygame.Rect(
+                        self.rect.x,
+                        self.rect.y + (i + 1) * self.rect.height,
+                        self.rect.width,
+                        self.rect.height,
+                    )
                     if opt_rect.collidepoint(event.pos):
                         self.value = option
                         self.open = False
-                        return
+                        if self.on_change:
+                            self.on_change(option)
+                        return True
                 self.open = False
-            elif self.rect.collidepoint(event.pos):
+                return True
+            if self.rect.collidepoint(event.pos):
                 self.open = True
-        elif event.type == pygame.MOUSEBUTTONDOWN and event.button != 1:
-            self.open = False
+                return True
+        elif event.type == pygame.MOUSEBUTTONDOWN:
+            if self.open:
+                self.open = False
+                return True
+        return False
 
     def draw(self, surface: pygame.Surface):
         pygame.draw.rect(surface, (80, 85, 100), self.rect, border_radius=4)
         text = self.font.render(self.value, True, TEXT_COLOR)
-        surface.blit(text, text.get_rect(center=self.rect.center))
+        text_rect = text.get_rect()
+        text_rect.midleft = (self.rect.x + 12, self.rect.centery)
+        surface.blit(text, text_rect)
+        arrow_points = [
+            (self.rect.right - 16, self.rect.centery - 4),
+            (self.rect.right - 8, self.rect.centery - 4),
+            (self.rect.right - 12, self.rect.centery + 4),
+        ]
+        pygame.draw.polygon(surface, TEXT_COLOR, arrow_points)
         if self.open:
             for i, option in enumerate(self.options):
-                opt_rect = pygame.Rect(self.rect.x, self.rect.y + (i + 1) * self.rect.height, self.rect.width, self.rect.height)
+                opt_rect = pygame.Rect(
+                    self.rect.x,
+                    self.rect.y + (i + 1) * self.rect.height,
+                    self.rect.width,
+                    self.rect.height,
+                )
                 pygame.draw.rect(surface, (60, 60, 70), opt_rect, border_radius=4)
                 txt = self.font.render(option, True, TEXT_COLOR)
                 surface.blit(txt, txt.get_rect(center=opt_rect.center))
-
-
 class TextInput(Widget):
     def __init__(self, rect: pygame.Rect, text: str, font: pygame.font.Font):
         super().__init__(rect)
@@ -771,6 +802,10 @@ class ParameterEditor:
         self.widgets: Dict[str, Widget] = {}
         self.error_message = ""
         self.success_message = ""
+        self.option_catalog: List[Tuple[str, str]] = []
+        self.option_map: Dict[str, str] = {}
+        self.highlight_key: Optional[str] = None
+        self.highlight_time = 0.0
         self._build_widgets()
 
     def _build_widgets(self):
@@ -806,12 +841,19 @@ class ParameterEditor:
             self.params.manual_input_mode,
             self.font,
         )
+        self.option_catalog = [
+            ("Compensation gravité", "gravity_compensation"),
+            ("Mode trajectoire", "trajectory_mode"),
+            ("Entrée manuelle", "manual_input_mode"),
+        ]
         y = self.area.y + 10 + 3 * 28
         for label, key in labels:
             rect = pygame.Rect(self.area.x + 10, y, self.area.width - 20, line_height)
             text_input = TextInput(rect, f"{getattr(self.params, key)}", self.font)
             self.widgets[key] = text_input
+            self.option_catalog.append((label, key))
             y += line_height + padding
+        self.option_map = {label: key for label, key in self.option_catalog}
 
     def update_from_params(self):
         self.checkbox.value = self.params.gravity_compensation
@@ -847,20 +889,61 @@ class ParameterEditor:
             self.params.manual_input_mode = self.manual_mode_dropdown.value
             self.error_message = ""
             self.success_message = "Paramètres mis à jour"
+            self.highlight_key = None
             return True
         except ValueError as exc:
             self.error_message = str(exc)
             self.success_message = ""
             return False
 
+    def option_labels(self) -> List[str]:
+        return [label for label, _ in self.option_catalog]
+
+    def focus_option_by_label(self, label: str):
+        key = self.option_map.get(label)
+        if not key:
+            return
+        self.highlight_key = key
+        self.highlight_time = time.time()
+        if key in self.widgets:
+            for widget in self.widgets.values():
+                if isinstance(widget, TextInput):
+                    widget.active = False
+            widget = self.widgets[key]
+            if isinstance(widget, TextInput):
+                widget.active = True
+        elif key == "trajectory_mode":
+            self.dropdown.open = True
+        elif key == "manual_input_mode":
+            self.manual_mode_dropdown.open = True
+
+    def clear_highlight(self):
+        self.highlight_key = None
+        self.dropdown.open = False
+        self.manual_mode_dropdown.open = False
+
     def draw(self, surface: pygame.Surface):
+        if self.highlight_key and time.time() - self.highlight_time > 4.0:
+            self.clear_highlight()
         pygame.draw.rect(surface, PANEL_BG, self.area)
+        if self.highlight_key == "gravity_compensation":
+            pygame.draw.rect(surface, HIGHLIGHT_COLOR, self.checkbox.rect.inflate(8, 8), width=2, border_radius=6)
         self.checkbox.draw(surface)
         label_mode = self.font.render("Mode trajectoire", True, TEXT_COLOR)
         surface.blit(label_mode, (self.dropdown.rect.x, self.dropdown.rect.y - 20))
+        if self.highlight_key == "trajectory_mode":
+            pygame.draw.rect(surface, HIGHLIGHT_COLOR, self.dropdown.rect.inflate(8, 8), width=2, border_radius=6)
         self.dropdown.draw(surface)
         label_manual_mode = self.font.render("Entrée manuelle", True, TEXT_COLOR)
         surface.blit(label_manual_mode, (self.manual_mode_dropdown.rect.x, self.manual_mode_dropdown.rect.y - 20))
+        if self.highlight_key == "manual_input_mode":
+            pygame.draw.rect(
+                surface,
+                HIGHLIGHT_COLOR,
+                self.manual_mode_dropdown.rect.inflate(8, 8),
+                width=2,
+                border_radius=6,
+            )
         self.manual_mode_dropdown.draw(surface)
         y = self.dropdown.rect.bottom + 10
         for label, key in self.labels:
@@ -868,6 +951,8 @@ class ParameterEditor:
             surface.blit(label_surface, (self.area.x + 12, y))
             widget = self.widgets[key]
             widget.rect.y = y + 18
+            if self.highlight_key == key and isinstance(widget, TextInput):
+                pygame.draw.rect(surface, HIGHLIGHT_COLOR, widget.rect.inflate(8, 8), width=2, border_radius=6)
             widget.draw(surface)
             y = widget.rect.bottom + 6
         auto_text = self.font.render(
@@ -883,8 +968,6 @@ class ParameterEditor:
         elif self.success_message:
             msg = self.font.render(self.success_message, True, SUCCESS_COLOR)
             surface.blit(msg, (self.area.x + 10, self.area.bottom - 60))
-
-
 class PlotPanel:
     def __init__(self, area: pygame.Rect, font: pygame.font.Font):
         self.area = area
@@ -1100,8 +1183,14 @@ class Application:
     def __init__(self, headless_test: bool = False):
         self.headless_test = headless_test
         pygame.init()
-        flags = pygame.HIDDEN if headless_test else 0
-        self.screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT), flags)
+        if headless_test:
+            flags = pygame.HIDDEN
+            size = (WINDOW_WIDTH, WINDOW_HEIGHT)
+        else:
+            flags = pygame.FULLSCREEN
+            size = (0, 0)
+        self.screen = pygame.display.set_mode(size, flags)
+        self.window_width, self.window_height = self.screen.get_size()
         pygame.display.set_caption("Bras rigide 1 axe")
         self.clock = pygame.time.Clock()
         self.font = pygame.font.Font(FONT_NAME, 18)
@@ -1113,18 +1202,33 @@ class Application:
         self.message = ""
         self.message_time = 0.0
         self.toolbar_buttons: List[Button] = []
+        self.toolbar_dropdowns: List[Dropdown] = []
+        self.modifier_dropdown: Optional[Dropdown] = None
+        self.sim_panel_width = int(self.window_width * 0.48)
+        self.plot_panel_width = self.window_width - self.sim_panel_width
         self.plot_panel = PlotPanel(
-            pygame.Rect(SIM_PANEL_WIDTH, TOOLBAR_HEIGHT, PLOT_PANEL_WIDTH, WINDOW_HEIGHT - TOOLBAR_HEIGHT),
+            pygame.Rect(
+                self.sim_panel_width,
+                TOOLBAR_HEIGHT,
+                self.plot_panel_width,
+                self.window_height - TOOLBAR_HEIGHT,
+            ),
             self.small_font,
         )
         self.sim_renderer = SimulationRenderer(
-            pygame.Rect(0, TOOLBAR_HEIGHT, SIM_PANEL_WIDTH, WINDOW_HEIGHT - TOOLBAR_HEIGHT), self.font
+            pygame.Rect(
+                0,
+                TOOLBAR_HEIGHT,
+                self.sim_panel_width,
+                self.window_height - TOOLBAR_HEIGHT,
+            ),
+            self.font,
         )
         editor_area = pygame.Rect(
-            SIM_PANEL_WIDTH + 10,
+            self.sim_panel_width + 10,
             TOOLBAR_HEIGHT + 10,
-            PLOT_PANEL_WIDTH - 20,
-            WINDOW_HEIGHT - TOOLBAR_HEIGHT - 20,
+            self.plot_panel_width - 20,
+            self.window_height - TOOLBAR_HEIGHT - 20,
         )
         self.editor = ParameterEditor(self.small_font, self.params, editor_area)
         self.create_toolbar()
@@ -1155,6 +1259,21 @@ class Application:
     # ------------------------------------------------------------------
 
     def create_toolbar(self):
+        self.toolbar_buttons.clear()
+        self.toolbar_dropdowns = []
+        dropdown_width = 260
+        dropdown_height = 32
+        dropdown_rect = pygame.Rect(10, (TOOLBAR_HEIGHT - dropdown_height) // 2, dropdown_width, dropdown_height)
+        options = ["Modifier..."] + self.editor.option_labels()
+        self.modifier_dropdown = Dropdown(
+            dropdown_rect,
+            options,
+            "Modifier...",
+            self.small_font,
+            on_change=self.on_modifier_option_selected,
+        )
+        self.toolbar_dropdowns.append(self.modifier_dropdown)
+        x = dropdown_rect.right + 12
         labels = [
             ("Modifier", self.toggle_mode),
             ("Lancer", self.on_launch),
@@ -1166,20 +1285,33 @@ class Application:
             ("Sauver cfg", self.save_params),
             ("Charger cfg", self.on_reload_config),
         ]
-        x = 10
         for label, callback in labels:
             rect = pygame.Rect(x, 10, 130, 40)
             self.toolbar_buttons.append(Button(rect, label, callback, self.small_font))
             x += rect.width + 8
 
+    def on_modifier_option_selected(self, option: str):
+        if option == "Modifier...":
+            return
+        if self.mode != "edit":
+            self.toggle_mode()
+        if self.mode == "edit":
+            self.editor.focus_option_by_label(option)
+            self.set_message(f"Sélection : {option}", success=True)
+        if self.modifier_dropdown:
+            self.modifier_dropdown.value = "Modifier..."
+            self.modifier_dropdown.open = False
+
     def toggle_mode(self):
         if self.mode == "run":
             self.mode = "edit"
             self.editor.update_from_params()
+            self.editor.clear_highlight()
             self.simulation.paused = True
             self.set_message("Mode édition actif", success=True)
         else:
             if self.editor.apply_changes():
+                self.editor.clear_highlight()
                 self.mode = "run"
                 self.simulation.update_parameters(self.params)
                 self.planner = TrajectoryPlanner(self.params)
@@ -1271,8 +1403,13 @@ class Application:
                     self.on_reset()
                 elif event.key == pygame.K_p:
                     self.on_pause()
-            for button in self.toolbar_buttons:
-                button.handle_event(event)
+            dropdown_consumed = False
+            for dropdown in self.toolbar_dropdowns:
+                if dropdown.handle_event(event):
+                    dropdown_consumed = True
+            if not dropdown_consumed:
+                for button in self.toolbar_buttons:
+                    button.handle_event(event)
             if self.mode == "edit":
                 self.editor.handle_event(event)
             else:
@@ -1280,15 +1417,17 @@ class Application:
         return True
 
     def draw_toolbar(self):
-        pygame.draw.rect(self.screen, TOOLBAR_BG, pygame.Rect(0, 0, WINDOW_WIDTH, TOOLBAR_HEIGHT))
+        pygame.draw.rect(self.screen, TOOLBAR_BG, pygame.Rect(0, 0, self.window_width, TOOLBAR_HEIGHT))
         for button in self.toolbar_buttons:
             button.draw(self.screen)
+        for dropdown in self.toolbar_dropdowns:
+            dropdown.draw(self.screen)
         if self.message:
             if time.time() - self.message_time > 4.0:
                 self.message = ""
             else:
                 text = self.small_font.render(self.message, True, self.message_color)
-                self.screen.blit(text, (WINDOW_WIDTH - text.get_width() - 20, 20))
+                self.screen.blit(text, (self.window_width - text.get_width() - 20, 20))
 
     def update(self, dt: float):
         sub_steps = max(1, int(dt * PHYSICS_HZ))
