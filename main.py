@@ -89,8 +89,11 @@ class ArmParameters:
     max_velocity: float = 6.0
     max_acceleration: float = 20.0
     gravity_compensation: bool = True
-    trajectory_mode: str = "time_optimal"  # ou "fixed_duration"
+    trajectory_mode: str = "time_optimal"  # ou "fixed_duration", "square_accel", "manual"
     target_duration: float = 3.0
+    manual_input_mode: str = "acceleration"  # ou "torque"
+    manual_profile_dt: float = 0.1
+    manual_profile_values: str = "5, -5"
 
     def inertia(self) -> float:
         i_arm = (1.0 / 3.0) * self.mass_arm * self.length ** 2
@@ -207,6 +210,78 @@ class TrajectoryProfile:
         return TrajectorySample(theta, omega, alpha)
 
 
+@dataclass
+class SquareAccelProfile:
+    """Profil avec accélération carrée : +K puis -K."""
+
+    theta0: float
+    thetaf: float
+    duration: float
+    accel: float
+
+    def sample(self, t: float) -> TrajectorySample:
+        sign = 1.0 if self.thetaf >= self.theta0 else -1.0
+        accel = self.accel * sign
+        if t <= 0.0:
+            return TrajectorySample(self.theta0, 0.0, accel)
+        if t >= self.duration:
+            return TrajectorySample(self.thetaf, 0.0, -accel)
+
+        half = self.duration / 2.0
+        if t <= half:
+            omega = accel * t
+            theta = self.theta0 + 0.5 * accel * t ** 2
+            alpha = accel
+        else:
+            tau = t - half
+            omega_mid = accel * half
+            theta_mid = self.theta0 + 0.5 * accel * half ** 2
+            omega = omega_mid - accel * tau
+            theta = theta_mid + omega_mid * tau - 0.5 * accel * tau ** 2
+            alpha = -accel
+        return TrajectorySample(theta, omega, alpha)
+
+
+@dataclass
+class ManualProfile:
+    """Profil défini par l'utilisateur à partir d'accélérations ou de couples."""
+
+    theta0: float
+    duration: float
+    dt: float
+    mode: str
+    times: List[float]
+    theta_values: List[float]
+    omega_values: List[float]
+    alpha_values: List[float]
+    torque_values: List[float]
+
+    def sample(self, t: float) -> TrajectorySample:
+        if t <= 0.0:
+            return TrajectorySample(self.theta_values[0], self.omega_values[0], self.alpha_values[0])
+        if t >= self.duration:
+            return TrajectorySample(self.theta_values[-1], self.omega_values[-1], self.alpha_values[-1])
+
+        index = min(int(t // self.dt), len(self.alpha_values) - 1)
+        local_t = t - self.times[index]
+        theta0 = self.theta_values[index]
+        omega0 = self.omega_values[index]
+        alpha = self.alpha_values[index]
+        theta = theta0 + omega0 * local_t + 0.5 * alpha * local_t ** 2
+        omega = omega0 + alpha * local_t
+        return TrajectorySample(theta, omega, alpha)
+
+    def torque_at(self, t: float) -> float:
+        if self.mode != "torque":
+            return 0.0
+        if t <= 0.0:
+            return self.torque_values[0]
+        if t >= self.duration:
+            return self.torque_values[-1]
+        index = min(int(t // self.dt), len(self.torque_values) - 1)
+        return self.torque_values[index]
+
+
 class TrajectoryPlanner:
     """Planifie une trajectoire respectant les contraintes couple/vitesse."""
 
@@ -285,7 +360,84 @@ class TrajectoryPlanner:
             profile.duration = target
             return profile
 
+        if mode == "square_accel":
+            target = max(0.01, self.params.target_duration)
+            theta0 = math.radians(self.params.start_angle_deg)
+            thetaf = math.radians(self.params.target_angle_deg)
+            delta = thetaf - theta0
+            if abs(delta) < 1e-9:
+                return SquareAccelProfile(theta0, thetaf, target, 0.0)
+            accel_needed = 4.0 * abs(delta) / (target ** 2)
+            accel_limit, _ = self.compute_limits()
+            if accel_needed > accel_limit + 1e-9:
+                raise TrajectoryError(
+                    "Accélération carrée requise {:.2f} rad/s² dépasse la limite {:.2f} rad/s²".format(
+                        accel_needed, accel_limit
+                    )
+                )
+            return SquareAccelProfile(theta0, thetaf, target, accel_needed)
+
+        if mode == "manual":
+            return self.build_manual_profile()
+
         raise TrajectoryError(f"Mode de trajectoire inconnu : {mode}")
+
+    def build_manual_profile(self) -> ManualProfile:
+        dt = max(1e-3, float(self.params.manual_profile_dt))
+        raw_values = [v.strip() for v in self.params.manual_profile_values.split(",") if v.strip()]
+        if not raw_values:
+            raise TrajectoryError("Aucune valeur saisie pour le profil manuel")
+        try:
+            values = [float(v) for v in raw_values]
+        except ValueError:
+            raise TrajectoryError("Valeurs du profil manuel invalides")
+
+        theta0 = math.radians(self.params.start_angle_deg)
+        model = ArmModel(self.params)
+        inertia = self.params.inertia()
+        theta = theta0
+        omega = 0.0
+        t = 0.0
+        times = [0.0]
+        theta_values = [theta0]
+        omega_values = [0.0]
+        alpha_values: List[float] = []
+        torque_values: List[float] = []
+
+        for value in values:
+            if self.params.manual_input_mode == "torque":
+                tau_motor = clamp(value, -abs(self.params.max_torque), abs(self.params.max_torque))
+                tau_g = model.gravity_torque(theta)
+                tau_d = model.damping_torque(omega)
+                alpha = (tau_motor + tau_g + tau_d) / inertia
+            else:
+                alpha = value
+                tau_motor = inertia * alpha - model.gravity_torque(theta) - model.damping_torque(omega)
+                tau_motor = clamp(tau_motor, -abs(self.params.max_torque), abs(self.params.max_torque))
+            alpha_values.append(alpha)
+            torque_values.append(tau_motor)
+            theta += omega * dt + 0.5 * alpha * dt * dt
+            omega += alpha * dt
+            t += dt
+            times.append(t)
+            theta_values.append(theta)
+            omega_values.append(omega)
+
+        duration = times[-1]
+        if duration <= 0.0:
+            raise TrajectoryError("Durée totale du profil manuel nulle")
+
+        return ManualProfile(
+            theta0=theta0,
+            duration=duration,
+            dt=dt,
+            mode=self.params.manual_input_mode,
+            times=times,
+            theta_values=theta_values,
+            omega_values=omega_values,
+            alpha_values=alpha_values,
+            torque_values=torque_values,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -381,16 +533,23 @@ class ArmSimulation:
 
         # Avance de modèle + correcteur proportionnel dérivé simple
         inertia = self.params.inertia()
-        tau_model = inertia * alpha_ref
-        if self.params.gravity_compensation:
-            tau_model -= self.model.gravity_torque(theta_ref)
-        tau_model -= self.model.damping_torque(omega_ref)
+        manual_torque = None
+        if isinstance(self.trajectory, ManualProfile) and self.trajectory.mode == "torque":
+            manual_torque = self.trajectory.torque_at(self.time)
 
-        error_theta = theta_ref - self.state.theta
-        error_omega = omega_ref - self.state.omega
-        tau_pd = self.kp * error_theta + self.kd * error_omega
-        tau_command = tau_model + tau_pd
-        tau_command = clamp(tau_command, -abs(self.params.max_torque), abs(self.params.max_torque))
+        if manual_torque is None:
+            tau_model = inertia * alpha_ref
+            if self.params.gravity_compensation:
+                tau_model -= self.model.gravity_torque(theta_ref)
+            tau_model -= self.model.damping_torque(omega_ref)
+
+            error_theta = theta_ref - self.state.theta
+            error_omega = omega_ref - self.state.omega
+            tau_pd = self.kp * error_theta + self.kd * error_omega
+            tau_command = tau_model + tau_pd
+            tau_command = clamp(tau_command, -abs(self.params.max_torque), abs(self.params.max_torque))
+        else:
+            tau_command = manual_torque
 
         alpha, tau_g, tau_d = self.model.compute_alpha(tau_command, self.state.theta, self.state.omega)
         self.state.omega += alpha * dt
@@ -586,6 +745,8 @@ class ParameterEditor:
             ("Vitesse max (rad/s)", "max_velocity"),
             ("Accélération max (rad/s²)", "max_acceleration"),
             ("Durée cible (s)", "target_duration"),
+            ("Profil manuel dt (s)", "manual_profile_dt"),
+            ("Profil manuel valeurs", "manual_profile_values"),
         ]
         self.labels = labels
         self.checkbox = Checkbox(
@@ -596,8 +757,14 @@ class ParameterEditor:
         )
         self.dropdown = Dropdown(
             pygame.Rect(self.area.x + 10, self.area.y + 10 + 2 * 24, 230, 28),
-            ["time_optimal", "fixed_duration"],
+            ["time_optimal", "fixed_duration", "square_accel", "manual"],
             self.params.trajectory_mode,
+            self.font,
+        )
+        self.manual_mode_dropdown = Dropdown(
+            pygame.Rect(self.area.x + 250, self.area.y + 10 + 2 * 24, 200, 28),
+            ["acceleration", "torque"],
+            self.params.manual_input_mode,
             self.font,
         )
         y = self.area.y + 10 + 3 * 28
@@ -610,6 +777,7 @@ class ParameterEditor:
     def update_from_params(self):
         self.checkbox.value = self.params.gravity_compensation
         self.dropdown.value = self.params.trajectory_mode
+        self.manual_mode_dropdown.value = self.params.manual_input_mode
         for key, widget in self.widgets.items():
             if isinstance(widget, TextInput):
                 widget.text = f"{getattr(self.params, key)}"
@@ -617,6 +785,7 @@ class ParameterEditor:
     def handle_event(self, event: pygame.event.Event):
         self.checkbox.handle_event(event)
         self.dropdown.handle_event(event)
+        self.manual_mode_dropdown.handle_event(event)
         for widget in self.widgets.values():
             widget.handle_event(event)
 
@@ -627,12 +796,16 @@ class ParameterEditor:
                     value = widget.text.strip().replace(",", ".")
                     if value == "":
                         raise ValueError(f"Champ {key} vide")
-                    if key in ("start_angle_deg", "target_angle_deg"):
+                    current = getattr(self.params, key)
+                    if isinstance(current, float):
                         setattr(self.params, key, float(value))
+                    elif isinstance(current, (int,)):
+                        setattr(self.params, key, int(float(value)))
                     else:
-                        setattr(self.params, key, float(value))
+                        setattr(self.params, key, value)
             self.params.gravity_compensation = self.checkbox.value
             self.params.trajectory_mode = self.dropdown.value
+            self.params.manual_input_mode = self.manual_mode_dropdown.value
             self.error_message = ""
             self.success_message = "Paramètres mis à jour"
             return True
@@ -647,6 +820,9 @@ class ParameterEditor:
         label_mode = self.font.render("Mode trajectoire", True, TEXT_COLOR)
         surface.blit(label_mode, (self.dropdown.rect.x, self.dropdown.rect.y - 20))
         self.dropdown.draw(surface)
+        label_manual_mode = self.font.render("Entrée manuelle", True, TEXT_COLOR)
+        surface.blit(label_manual_mode, (self.manual_mode_dropdown.rect.x, self.manual_mode_dropdown.rect.y - 20))
+        self.manual_mode_dropdown.draw(surface)
         y = self.dropdown.rect.bottom + 10
         for label, key in self.labels:
             label_surface = self.font.render(label, True, TEXT_COLOR)
@@ -676,6 +852,7 @@ class PlotPanel:
         self.scroll_offset = 0.0
         self.checkbox_rects: Dict[str, pygame.Rect] = {}
         self.legend_height = 22
+        self.num_ticks = 5
 
     def toggle_freeze(self):
         self.freeze = not self.freeze
@@ -741,20 +918,44 @@ class PlotPanel:
         if t1 - t0 < 1e-6:
             return
 
+        active_signals = [name for name in self.signals if self.selected.get(name, False) and self.cached_data[name]]
+        if not active_signals:
+            return
+
+        global_min = min(min(self.cached_data[name]) for name in active_signals)
+        global_max = max(max(self.cached_data[name]) for name in active_signals)
+        if abs(global_max - global_min) < 1e-9:
+            global_max += 1.0
+            global_min -= 1.0
+        padding = 0.05 * (global_max - global_min)
+        y_min = global_min - padding
+        y_max = global_max + padding
+        scale_text = self.font.render(f"Échelle : [{y_min:.2f}, {y_max:.2f}]", True, TEXT_COLOR)
+        surface.blit(scale_text, (plot_rect.x + 4, plot_rect.bottom + 6))
+
+        for i in range(self.num_ticks + 1):
+            frac = i / self.num_ticks
+            y = plot_rect.bottom - frac * plot_rect.height
+            value = y_min + frac * (y_max - y_min)
+            pygame.draw.line(surface, (60, 60, 70), (plot_rect.x, y), (plot_rect.right, y), width=1)
+            label = self.font.render(f"{value:.2f}", True, (150, 150, 160))
+            surface.blit(label, (plot_rect.x - label.get_width() - 6, y - label.get_height() / 2))
+
+        pygame.draw.line(surface, (120, 120, 140), (plot_rect.x, plot_rect.bottom), (plot_rect.x, plot_rect.y), width=1)
+
         legend_index = 0
         for name, values in self.cached_data.items():
             if not self.selected.get(name, False):
                 continue
             color = TRACE_COLORS.get(name, (200, 200, 200))
+            if not values:
+                continue
             min_v = min(values)
             max_v = max(values)
-            if abs(max_v - min_v) < 1e-9:
-                max_v += 1
-                min_v -= 1
             points = []
             for t, v in zip(self.time_data, values):
                 px = plot_rect.x + (t - t0) / (t1 - t0) * plot_rect.width
-                py = plot_rect.bottom - (v - min_v) / (max_v - min_v) * plot_rect.height
+                py = plot_rect.bottom - (v - y_min) / (y_max - y_min) * plot_rect.height
                 points.append((px, py))
             if len(points) >= 2:
                 pygame.draw.lines(surface, color, False, points, 2)
