@@ -1010,9 +1010,18 @@ class PlotPanel:
         self.checkbox_rects: Dict[str, pygame.Rect] = {}
         self.legend_height = 22
         self.num_ticks = 5
+        self.cursor_enabled = False
+        self.cursor_pos: Optional[Tuple[int, int]] = None
+        self.plot_rect = pygame.Rect(0, 0, 0, 0)
 
     def toggle_freeze(self):
         self.freeze = not self.freeze
+
+    def toggle_cursor(self) -> bool:
+        self.cursor_enabled = not self.cursor_enabled
+        if not self.cursor_enabled:
+            self.cursor_pos = None
+        return self.cursor_enabled
 
     def reset(self):
         self.cached_data = {name: [] for name in self.signals}
@@ -1045,6 +1054,11 @@ class PlotPanel:
             for name, rect in self.checkbox_rects.items():
                 if rect.collidepoint(pos):
                     self.selected[name] = not self.selected[name]
+        elif event.type == pygame.MOUSEMOTION and self.cursor_enabled:
+            if self.plot_rect.collidepoint(event.pos):
+                self.cursor_pos = event.pos
+            else:
+                self.cursor_pos = None
 
     def draw(self, surface: pygame.Surface):
         pygame.draw.rect(surface, PANEL_BG, self.area)
@@ -1080,6 +1094,7 @@ class PlotPanel:
             self.area.width - 20,
             self.area.height - legend_area.height - 40,
         )
+        self.plot_rect = plot_rect
         pygame.draw.rect(surface, (20, 20, 28), plot_rect)
         pygame.draw.rect(surface, (80, 80, 90), plot_rect, width=1)
 
@@ -1135,6 +1150,31 @@ class PlotPanel:
             label = self.font.render(f"{name}: [{min_v:.2f}, {max_v:.2f}]", True, color)
             surface.blit(label, (plot_rect.x + 4, plot_rect.y + 4 + self.legend_height * legend_index))
             legend_index += 1
+
+        if self.cursor_enabled and self.cursor_pos and plot_rect.collidepoint(self.cursor_pos):
+            cursor_x, cursor_y = self.cursor_pos
+            cursor_x = clamp(cursor_x, plot_rect.left, plot_rect.right)
+            cursor_y = clamp(cursor_y, plot_rect.top, plot_rect.bottom)
+            pygame.draw.line(surface, HIGHLIGHT_COLOR, (cursor_x, plot_rect.top), (cursor_x, plot_rect.bottom), 1)
+            pygame.draw.line(surface, HIGHLIGHT_COLOR, (plot_rect.left, cursor_y), (plot_rect.right, cursor_y), 1)
+
+            cursor_time = t0 + (cursor_x - plot_rect.x) / plot_rect.width * (t1 - t0)
+            closest_index = min(range(len(self.time_data)), key=lambda i: abs(self.time_data[i] - cursor_time))
+            info_lines = [f"t = {self.time_data[closest_index]:.3f} s"]
+            for name in active_signals:
+                value = self.cached_data[name][closest_index]
+                info_lines.append(f"{name} = {value:.3f}")
+
+            info_width = max(self.font.render(text, True, TEXT_COLOR).get_width() for text in info_lines) + 12
+            info_height = len(info_lines) * 18 + 8
+            info_surface = pygame.Surface((info_width, info_height), pygame.SRCALPHA)
+            info_surface.fill((20, 20, 28, 220))
+            for i, text in enumerate(info_lines):
+                label = self.font.render(text, True, TEXT_COLOR)
+                info_surface.blit(label, (6, 4 + i * 18))
+            info_x = clamp(cursor_x + 12, plot_rect.left, plot_rect.right - info_surface.get_width())
+            info_y = clamp(cursor_y - info_surface.get_height() - 12, plot_rect.top, plot_rect.bottom - info_surface.get_height())
+            surface.blit(info_surface, (info_x, info_y))
 
 
 # ---------------------------------------------------------------------------
@@ -1303,6 +1343,7 @@ class Application:
             ("Pause", self.on_pause),
             ("Courbes freeze", self.on_freeze_plots),
             ("Courbes reset", self.on_reset_plots),
+            ("Curseur", self.on_toggle_cursor),
             ("Sauver cfg", self.save_params),
             ("Charger cfg", self.on_reload_config),
         ]
@@ -1382,6 +1423,10 @@ class Application:
     def on_reset_plots(self):
         self.plot_panel.reset()
         self.set_message("Courbes réinitialisées", success=True)
+
+    def on_toggle_cursor(self):
+        enabled = self.plot_panel.toggle_cursor()
+        self.set_message("Curseur activé" if enabled else "Curseur désactivé", success=True)
 
     def on_reload_config(self):
         self.params = self.load_params()
