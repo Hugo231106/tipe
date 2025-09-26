@@ -56,10 +56,9 @@ TRACE_COLORS = {
     "angle": (255, 200, 0),
     "omega": (0, 220, 255),
     "alpha": (180, 255, 140),
-    "tau_motor": (255, 120, 120),
-    "tau_gravity": (255, 200, 180),
-    "tau_damping": (150, 200, 120),
-    "tau_total": (255, 160, 90),
+    "couple_moteur": (255, 120, 120),
+    "couple_gravite": (255, 200, 180),
+    "couple_total": (255, 160, 90),
     "power": (220, 180, 255),
     "x": (220, 220, 220),
     "y": (160, 220, 200),
@@ -87,7 +86,6 @@ class ArmParameters:
     mass_arm: float = 1.2
     mass_load: float = 0.4
     gravity: float = 9.81
-    damping: float = 0.12
     start_angle_deg: float = -30.0
     target_angle_deg: float = 75.0
     max_torque: float = 18.0
@@ -156,14 +154,10 @@ class ArmModel:
     def gravity_torque(self, theta: float) -> float:
         return -self.params.gravity_term() * math.sin(theta)
 
-    def damping_torque(self, omega: float) -> float:
-        return -self.params.damping * omega
-
-    def compute_alpha(self, tau_motor: float, theta: float, omega: float) -> Tuple[float, float, float]:
+    def compute_alpha(self, couple_moteur: float, theta: float, omega: float) -> Tuple[float, float]:
         tau_g = self.gravity_torque(theta)
-        tau_d = self.damping_torque(omega)
-        alpha = (tau_motor + tau_g + tau_d) / self.params.inertia()
-        return alpha, tau_g, tau_d
+        alpha = (couple_moteur + tau_g) / self.params.inertia()
+        return alpha, tau_g
 
 
 # ---------------------------------------------------------------------------
@@ -428,16 +422,15 @@ class TrajectoryPlanner:
 
         for value in values:
             if self.params.manual_input_mode == "torque":
-                tau_motor = clamp(value, -abs(self.params.max_torque), abs(self.params.max_torque))
-                tau_g = model.gravity_torque(theta)
-                tau_d = model.damping_torque(omega)
-                alpha = (tau_motor + tau_g + tau_d) / inertia
+                couple_moteur = clamp(value, -abs(self.params.max_torque), abs(self.params.max_torque))
+                couple_gravite = model.gravity_torque(theta)
+                alpha = (couple_moteur + couple_gravite) / inertia
             else:
                 alpha = value
-                tau_motor = inertia * alpha - model.gravity_torque(theta) - model.damping_torque(omega)
-                tau_motor = clamp(tau_motor, -abs(self.params.max_torque), abs(self.params.max_torque))
+                couple_moteur = inertia * alpha - model.gravity_torque(theta)
+                couple_moteur = clamp(couple_moteur, -abs(self.params.max_torque), abs(self.params.max_torque))
             alpha_values.append(alpha)
-            torque_values.append(tau_motor)
+            torque_values.append(couple_moteur)
             theta += omega * dt + 0.5 * alpha * dt * dt
             omega += alpha * dt
             t += dt
@@ -480,10 +473,9 @@ class LogEntry:
     theta_ref: float
     omega_ref: float
     alpha_ref: float
-    tau_motor: float
-    tau_gravity: float
-    tau_damping: float
-    tau_total: float
+    couple_moteur: float
+    couple_gravite: float
+    couple_total: float
     power: float
     x: float
     y: float
@@ -504,9 +496,9 @@ class ArmSimulation:
         self.trajectory: TrajectoryProfile = TrajectoryProfile(
             self.state.theta, self.state.theta, 0.0, 0.0, 0.0, 1.0, 1.0
         )
-        self.last_tau_motor = 0.0
-        self.last_tau_gravity = 0.0
-        self.last_tau_damping = 0.0
+        self.last_couple_moteur = 0.0
+        self.last_couple_gravite = 0.0
+        self.last_couple_total = 0.0
         self.last_power = 0.0
         self.log: List[LogEntry] = []
         self.progress = 0.0
@@ -529,9 +521,9 @@ class ArmSimulation:
         self.running = False
         self.paused = False
         self.progress = 0.0
-        self.last_tau_motor = 0.0
-        self.last_tau_damping = 0.0
-        self.last_tau_gravity = self.model.gravity_torque(self.state.theta)
+        self.last_couple_moteur = 0.0
+        self.last_couple_total = 0.0
+        self.last_couple_gravite = self.model.gravity_torque(self.state.theta)
         self.last_power = 0.0
         self.log.clear()
 
@@ -567,29 +559,30 @@ class ArmSimulation:
             manual_torque = self.trajectory.torque_at(self.time)
 
         if manual_torque is None:
-            tau_model = inertia * alpha_ref
+            couple_modele = inertia * alpha_ref
             if self.params.gravity_compensation:
-                tau_model -= self.model.gravity_torque(theta_ref)
-            tau_model -= self.model.damping_torque(omega_ref)
+                couple_modele -= self.model.gravity_torque(theta_ref)
 
             error_theta = theta_ref - self.state.theta
             error_omega = omega_ref - self.state.omega
-            tau_pd = self.kp * error_theta + self.kd * error_omega
-            tau_command = tau_model + tau_pd
-            tau_command = clamp(tau_command, -abs(self.params.max_torque), abs(self.params.max_torque))
+            couple_pd = self.kp * error_theta + self.kd * error_omega
+            couple_commande = couple_modele + couple_pd
+            couple_commande = clamp(couple_commande, -abs(self.params.max_torque), abs(self.params.max_torque))
         else:
-            tau_command = manual_torque
+            couple_commande = manual_torque
 
-        alpha, tau_g, tau_d = self.model.compute_alpha(tau_command, self.state.theta, self.state.omega)
+        alpha, couple_gravite = self.model.compute_alpha(
+            couple_commande, self.state.theta, self.state.omega
+        )
         self.state.omega += alpha * dt
         self.state.omega = clamp(self.state.omega, -abs(self.params.max_velocity) * 1.5, abs(self.params.max_velocity) * 1.5)
         self.state.theta += self.state.omega * dt
         self.state.alpha = alpha
 
-        self.last_tau_motor = tau_command
-        self.last_tau_gravity = tau_g
-        self.last_tau_damping = tau_d
-        self.last_power = tau_command * self.state.omega
+        self.last_couple_moteur = couple_commande
+        self.last_couple_gravite = couple_gravite
+        self.last_couple_total = couple_commande + couple_gravite
+        self.last_power = couple_commande * self.state.omega
 
         end_point = self.tip_position()
         x_tip, y_tip = end_point
@@ -618,10 +611,9 @@ class ArmSimulation:
                     theta_ref=theta_ref,
                     omega_ref=omega_ref,
                     alpha_ref=alpha_ref,
-                    tau_motor=tau_command,
-                    tau_gravity=tau_g,
-                    tau_damping=tau_d,
-                    tau_total=tau_command + tau_g + tau_d,
+                    couple_moteur=couple_commande,
+                    couple_gravite=couple_gravite,
+                    couple_total=couple_commande + couple_gravite,
                     power=self.last_power,
                     x=x_tip,
                     y=y_tip,
@@ -979,10 +971,9 @@ class PlotPanel:
             "angle",
             "omega",
             "alpha",
-            "tau_motor",
-            "tau_gravity",
-            "tau_damping",
-            "tau_total",
+            "couple_moteur",
+            "couple_gravite",
+            "couple_total",
             "power",
             "x",
             "y",
@@ -998,10 +989,9 @@ class PlotPanel:
                 "angle",
                 "omega",
                 "alpha",
-                "tau_motor",
-                "tau_gravity",
-                "tau_damping",
-                "tau_total",
+                "couple_moteur",
+                "couple_gravite",
+                "couple_total",
                 "power",
                 "x",
                 "y",
@@ -1041,10 +1031,9 @@ class PlotPanel:
             self.cached_data["vy"].append(entry.vy)
             self.cached_data["ax"].append(entry.ax)
             self.cached_data["ay"].append(entry.ay)
-            self.cached_data["tau_motor"].append(entry.tau_motor)
-            self.cached_data["tau_gravity"].append(entry.tau_gravity)
-            self.cached_data["tau_damping"].append(entry.tau_damping)
-            self.cached_data["tau_total"].append(entry.tau_total)
+            self.cached_data["couple_moteur"].append(entry.couple_moteur)
+            self.cached_data["couple_gravite"].append(entry.couple_gravite)
+            self.cached_data["couple_total"].append(entry.couple_total)
             self.cached_data["power"].append(entry.power)
             self.cached_data["x"].append(entry.x)
             self.cached_data["y"].append(entry.y)
@@ -1183,9 +1172,9 @@ class SimulationRenderer:
             f"Angle : {math.degrees(sim.state.theta):6.2f}°",
             f"Vitesse : {sim.state.omega:6.2f} rad/s",
             f"Accélération : {sim.state.alpha:6.2f} rad/s²",
-            f"Couple moteur : {sim.last_tau_motor:6.2f} N·m",
-            f"Couple gravité : {sim.last_tau_gravity:6.2f} N·m",
-            f"Couple amort. : {sim.last_tau_damping:6.2f} N·m",
+            f"Couple moteur : {sim.last_couple_moteur:6.2f} N·m",
+            f"Couple gravité : {sim.last_couple_gravite:6.2f} N·m",
+            f"Couple total   : {sim.last_couple_total:6.2f} N·m",
             f"Inertie équiv. : {sim.params.inertia():6.3f} kg·m²",
             f"Puissance : {sim.last_power:6.2f} W",
             f"Mode : {sim.params.trajectory_mode}",
@@ -1371,11 +1360,11 @@ class Application:
         try:
             with open(EXPORT_PATH, "w", encoding="utf-8") as fp:
                 fp.write(
-                    "time,theta,omega,alpha,theta_ref,omega_ref,alpha_ref,tau_motor,tau_gravity,tau_damping,power,x,y,vx,vy,ax,ay\n"
+                    "time,theta,omega,alpha,theta_ref,omega_ref,alpha_ref,couple_moteur,couple_gravite,couple_total,power,x,y,vx,vy,ax,ay\n"
                 )
                 for entry in self.simulation.log:
                     fp.write(
-                        f"{entry.t:.5f},{entry.theta:.6f},{entry.omega:.6f},{entry.alpha:.6f},{entry.theta_ref:.6f},{entry.omega_ref:.6f},{entry.alpha_ref:.6f},{entry.tau_motor:.6f},{entry.tau_gravity:.6f},{entry.tau_damping:.6f},{entry.power:.6f},{entry.x:.6f},{entry.y:.6f},{entry.vx:.6f},{entry.vy:.6f},{entry.ax:.6f},{entry.ay:.6f}\n"
+                        f"{entry.t:.5f},{entry.theta:.6f},{entry.omega:.6f},{entry.alpha:.6f},{entry.theta_ref:.6f},{entry.omega_ref:.6f},{entry.alpha_ref:.6f},{entry.couple_moteur:.6f},{entry.couple_gravite:.6f},{entry.couple_total:.6f},{entry.power:.6f},{entry.x:.6f},{entry.y:.6f},{entry.vx:.6f},{entry.vy:.6f},{entry.ax:.6f},{entry.ay:.6f}\n"
                     )
             self.set_message(f"Exporté vers {EXPORT_PATH}", success=True)
         except OSError as exc:
