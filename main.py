@@ -63,6 +63,10 @@ TRACE_COLORS = {
     "x": (220, 220, 220),
     "y": (160, 220, 200),
     "z": (140, 160, 220),
+    "vx": (200, 150, 255),
+    "vy": (150, 200, 255),
+    "ax": (255, 180, 220),
+    "ay": (180, 220, 255),
 }
 
 # ---------------------------------------------------------------------------
@@ -89,11 +93,12 @@ class ArmParameters:
     max_velocity: float = 6.0
     max_acceleration: float = 20.0
     gravity_compensation: bool = True
-    trajectory_mode: str = "time_optimal"  # ou "fixed_duration", "square_accel", "manual"
+    trajectory_mode: str = "fixed_duration"  # ou "time_optimal", "square_accel", "manual"
     target_duration: float = 3.0
     manual_input_mode: str = "acceleration"  # ou "torque"
     manual_profile_dt: float = 0.1
     manual_profile_values: str = "5, -5"
+    auto_limits: bool = True
 
     def inertia(self) -> float:
         i_arm = (1.0 / 3.0) * self.mass_arm * self.length ** 2
@@ -105,6 +110,21 @@ class ArmParameters:
             self.mass_arm * self.gravity * self.length / 2.0
             + self.mass_load * self.gravity * self.length
         )
+
+    def update_auto_limits(self):
+        if not self.auto_limits:
+            return
+        duration = max(0.1, float(self.target_duration))
+        theta0 = math.radians(self.start_angle_deg)
+        thetaf = math.radians(self.target_angle_deg)
+        delta = abs(thetaf - theta0)
+        if delta < 1e-4:
+            delta = 1e-4
+        self.max_velocity = max(0.1, 2.0 * delta / duration)
+        self.max_acceleration = max(0.1, 4.0 * delta / (duration ** 2))
+        inertia = self.inertia()
+        torque_required = inertia * self.max_acceleration + abs(self.gravity_term())
+        self.max_torque = max(1.0, torque_required * 1.1)
 
     def to_dict(self) -> Dict[str, object]:
         data = asdict(self)
@@ -334,6 +354,7 @@ class TrajectoryPlanner:
             return profile, duration
 
     def plan(self) -> TrajectoryProfile:
+        self.params.update_auto_limits()
         profile, minimal_duration = self.plan_minimal_profile()
         mode = self.params.trajectory_mode
         if minimal_duration == 0:
@@ -451,6 +472,10 @@ class LogEntry:
     theta: float
     omega: float
     alpha: float
+    vx: float
+    vy: float
+    ax: float
+    ay: float
     theta_ref: float
     omega_ref: float
     alpha_ref: float
@@ -468,6 +493,7 @@ class ArmSimulation:
 
     def __init__(self, params: ArmParameters):
         self.params = params
+        self.params.update_auto_limits()
         self.model = ArmModel(params)
         self.state = ArmState(theta=math.radians(params.start_angle_deg))
         self.running = False
@@ -488,6 +514,7 @@ class ArmSimulation:
 
     def update_parameters(self, params: ArmParameters):
         self.params = params
+        self.params.update_auto_limits()
         self.model = ArmModel(params)
 
     def set_trajectory(self, trajectory: TrajectoryProfile):
@@ -563,6 +590,18 @@ class ArmSimulation:
         self.last_power = tau_command * self.state.omega
 
         end_point = self.tip_position()
+        x_tip, y_tip = end_point
+        length = self.params.length
+        omega = self.state.omega
+        alpha = self.state.alpha
+        vx = -length * omega * math.sin(self.state.theta)
+        vy = length * omega * math.cos(self.state.theta)
+        ax_lin = -length * (
+            math.sin(self.state.theta) * alpha + math.cos(self.state.theta) * omega ** 2
+        )
+        ay_lin = length * (
+            math.cos(self.state.theta) * alpha - math.sin(self.state.theta) * omega ** 2
+        )
         if not self.freeze_logs:
             self.log.append(
                 LogEntry(
@@ -570,6 +609,10 @@ class ArmSimulation:
                     theta=self.state.theta,
                     omega=self.state.omega,
                     alpha=self.state.alpha,
+                    vx=vx,
+                    vy=vy,
+                    ax=ax_lin,
+                    ay=ay_lin,
                     theta_ref=theta_ref,
                     omega_ref=omega_ref,
                     alpha_ref=alpha_ref,
@@ -577,8 +620,8 @@ class ArmSimulation:
                     tau_gravity=tau_g,
                     tau_damping=tau_d,
                     power=self.last_power,
-                    x=end_point[0],
-                    y=end_point[1],
+                    x=x_tip,
+                    y=y_tip,
                     z=0.0,
                 )
             )
@@ -740,10 +783,6 @@ class ParameterEditor:
             ("Masse bras (kg)", "mass_arm"),
             ("Masse charge (kg)", "mass_load"),
             ("Gravité (m/s²)", "gravity"),
-            ("Amortissement", "damping"),
-            ("Couple max (N.m)", "max_torque"),
-            ("Vitesse max (rad/s)", "max_velocity"),
-            ("Accélération max (rad/s²)", "max_acceleration"),
             ("Durée cible (s)", "target_duration"),
             ("Profil manuel dt (s)", "manual_profile_dt"),
             ("Profil manuel valeurs", "manual_profile_values"),
@@ -831,6 +870,13 @@ class ParameterEditor:
             widget.rect.y = y + 18
             widget.draw(surface)
             y = widget.rect.bottom + 6
+        auto_text = self.font.render(
+            "Limites de couple/vitesse/accélération calculées automatiquement.",
+            True,
+            TEXT_COLOR,
+        )
+        surface.blit(auto_text, (self.area.x + 12, y + 6))
+        y += auto_text.get_height() + 10
         if self.error_message:
             err = self.font.render(self.error_message, True, ERROR_COLOR)
             surface.blit(err, (self.area.x + 10, self.area.bottom - 60))
@@ -843,8 +889,27 @@ class PlotPanel:
     def __init__(self, area: pygame.Rect, font: pygame.font.Font):
         self.area = area
         self.font = font
-        self.signals = list(TRACE_COLORS.keys())
-        self.selected: Dict[str, bool] = {name: name in ("angle", "omega", "tau_motor") for name in self.signals}
+        self.signals = [
+            "angle",
+            "omega",
+            "alpha",
+            "tau_motor",
+            "tau_gravity",
+            "tau_damping",
+            "power",
+            "x",
+            "y",
+            "vx",
+            "vy",
+            "ax",
+            "ay",
+            "z",
+        ]
+        self.selected: Dict[str, bool] = {
+            name: name
+            in ("angle", "omega", "alpha", "tau_motor", "x", "y", "vx", "vy", "ax", "ay")
+            for name in self.signals
+        }
         self.freeze = False
         self.max_points = 2000
         self.cached_data: Dict[str, List[float]] = {name: [] for name in self.signals}
@@ -870,6 +935,10 @@ class PlotPanel:
             self.cached_data["angle"].append(entry.theta)
             self.cached_data["omega"].append(entry.omega)
             self.cached_data["alpha"].append(entry.alpha)
+            self.cached_data["vx"].append(entry.vx)
+            self.cached_data["vy"].append(entry.vy)
+            self.cached_data["ax"].append(entry.ax)
+            self.cached_data["ay"].append(entry.ay)
             self.cached_data["tau_motor"].append(entry.tau_motor)
             self.cached_data["tau_gravity"].append(entry.tau_gravity)
             self.cached_data["tau_damping"].append(entry.tau_damping)
@@ -1138,11 +1207,11 @@ class Application:
         try:
             with open(EXPORT_PATH, "w", encoding="utf-8") as fp:
                 fp.write(
-                    "time,theta,omega,alpha_ref,tau_motor,tau_gravity,tau_damping,power\n"
+                    "time,theta,omega,alpha,theta_ref,omega_ref,alpha_ref,tau_motor,tau_gravity,tau_damping,power,x,y,vx,vy,ax,ay\n"
                 )
                 for entry in self.simulation.log:
                     fp.write(
-                        f"{entry.t:.5f},{entry.theta:.6f},{entry.omega:.6f},{entry.alpha_ref:.6f},{entry.tau_motor:.6f},{entry.tau_gravity:.6f},{entry.tau_damping:.6f},{entry.power:.6f}\n"
+                        f"{entry.t:.5f},{entry.theta:.6f},{entry.omega:.6f},{entry.alpha:.6f},{entry.theta_ref:.6f},{entry.omega_ref:.6f},{entry.alpha_ref:.6f},{entry.tau_motor:.6f},{entry.tau_gravity:.6f},{entry.tau_damping:.6f},{entry.power:.6f},{entry.x:.6f},{entry.y:.6f},{entry.vx:.6f},{entry.vy:.6f},{entry.ax:.6f},{entry.ay:.6f}\n"
                     )
             self.set_message(f"Exporté vers {EXPORT_PATH}", success=True)
         except OSError as exc:
@@ -1181,6 +1250,7 @@ class Application:
     # ------------------------------------------------------------------
 
     def recompute_trajectory(self, initial: bool = False, start_after: bool = True):
+        self.params.update_auto_limits()
         profile = self.planner.plan()
         self.simulation.set_trajectory(profile)
         if not initial and start_after:
