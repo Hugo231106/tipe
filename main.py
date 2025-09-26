@@ -59,6 +59,7 @@ TRACE_COLORS = {
     "tau_motor": (255, 120, 120),
     "tau_gravity": (255, 200, 180),
     "tau_damping": (150, 200, 120),
+    "tau_total": (255, 160, 90),
     "power": (220, 180, 255),
     "x": (220, 220, 220),
     "y": (160, 220, 200),
@@ -482,6 +483,7 @@ class LogEntry:
     tau_motor: float
     tau_gravity: float
     tau_damping: float
+    tau_total: float
     power: float
     x: float
     y: float
@@ -619,6 +621,7 @@ class ArmSimulation:
                     tau_motor=tau_command,
                     tau_gravity=tau_g,
                     tau_damping=tau_d,
+                    tau_total=tau_command + tau_g + tau_d,
                     power=self.last_power,
                     x=x_tip,
                     y=y_tip,
@@ -979,6 +982,7 @@ class PlotPanel:
             "tau_motor",
             "tau_gravity",
             "tau_damping",
+            "tau_total",
             "power",
             "x",
             "y",
@@ -990,7 +994,22 @@ class PlotPanel:
         ]
         self.selected: Dict[str, bool] = {
             name: name
-            in ("angle", "omega", "alpha", "tau_motor", "x", "y", "vx", "vy", "ax", "ay")
+            in (
+                "angle",
+                "omega",
+                "alpha",
+                "tau_motor",
+                "tau_gravity",
+                "tau_damping",
+                "tau_total",
+                "power",
+                "x",
+                "y",
+                "vx",
+                "vy",
+                "ax",
+                "ay",
+            )
             for name in self.signals
         }
         self.freeze = False
@@ -1025,6 +1044,7 @@ class PlotPanel:
             self.cached_data["tau_motor"].append(entry.tau_motor)
             self.cached_data["tau_gravity"].append(entry.tau_gravity)
             self.cached_data["tau_damping"].append(entry.tau_damping)
+            self.cached_data["tau_total"].append(entry.tau_total)
             self.cached_data["power"].append(entry.power)
             self.cached_data["x"].append(entry.x)
             self.cached_data["y"].append(entry.y)
@@ -1039,18 +1059,30 @@ class PlotPanel:
 
     def draw(self, surface: pygame.Surface):
         pygame.draw.rect(surface, PANEL_BG, self.area)
-        legend_area = pygame.Rect(self.area.x + 10, self.area.y + 10, self.area.width - 20, 20)
+        legend_rows = 2
+        checkbox_height = 16
+        row_spacing = 8
+        legend_height = legend_rows * (checkbox_height + row_spacing) - row_spacing
+        legend_area = pygame.Rect(
+            self.area.x + 10,
+            self.area.y + 10,
+            self.area.width - 20,
+            legend_height,
+        )
         # Draw checkboxes
-        x = legend_area.x
+        items_per_row = math.ceil(len(self.signals) / legend_rows)
+        row_x = [legend_area.x for _ in range(legend_rows)]
         self.checkbox_rects.clear()
-        for name in self.signals:
-            checkbox = pygame.Rect(x, legend_area.y, 16, 16)
+        for index, name in enumerate(self.signals):
+            row = min(index // items_per_row, legend_rows - 1)
+            col_y = legend_area.y + row * (checkbox_height + row_spacing)
+            checkbox = pygame.Rect(row_x[row], col_y, checkbox_height, checkbox_height)
             pygame.draw.rect(surface, TRACE_COLORS[name], checkbox, width=2)
             if self.selected[name]:
                 pygame.draw.rect(surface, TRACE_COLORS[name], checkbox.inflate(-4, -4))
             label = self.font.render(name, True, TEXT_COLOR)
             surface.blit(label, (checkbox.right + 4, checkbox.y - 2))
-            x = checkbox.right + label.get_width() + 20
+            row_x[row] = checkbox.right + label.get_width() + 20
             self.checkbox_rects[name] = checkbox
 
         plot_rect = pygame.Rect(
