@@ -469,22 +469,30 @@ class ArmSimulation:
         if isinstance(self.trajectory, ManualProfile) and self.trajectory.mode == "torque":
             manual_torque = self.trajectory.torque_at(self.time)
 
+        couple_gravite_state = self.model.gravity_torque(self.state.theta)
+
         if manual_torque is None:
-            couple_modele = inertia * alpha_ref
-            if self.params.gravity_compensation:
-                couple_modele -= self.model.gravity_torque(theta_ref)
-
-            error_theta = theta_ref - self.state.theta
-            error_omega = omega_ref - self.state.omega
-            couple_pd = self.kp * error_theta + self.kd * error_omega
-            couple_commande = couple_modele + couple_pd
-            couple_commande = clamp(couple_commande, -abs(self.params.max_torque), abs(self.params.max_torque))
+            couple_commande, tau_g = self.model.required_torque(
+                alpha_ref, self.state.theta
+            )
+            if not self.params.gravity_compensation:
+                couple_commande += tau_g
+            couple_commande = clamp(
+                couple_commande,
+                -abs(self.params.max_torque),
+                abs(self.params.max_torque),
+            )
+            alpha = alpha_ref
+            couple_gravite = couple_gravite_state
         else:
-            couple_commande = manual_torque
+            couple_commande = clamp(
+                manual_torque,
+                -abs(self.params.max_torque),
+                abs(self.params.max_torque),
+            )
+            couple_gravite = couple_gravite_state
+            alpha = (couple_commande + couple_gravite) / inertia
 
-        alpha, couple_gravite = self.model.compute_alpha(
-            couple_commande, self.state.theta, self.state.omega
-        )
         self.state.omega += alpha * dt
         self.state.omega = clamp(self.state.omega, -abs(self.params.max_velocity) * 1.5, abs(self.params.max_velocity) * 1.5)
         self.state.theta += self.state.omega * dt

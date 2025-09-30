@@ -87,6 +87,20 @@ class ArmModel:
     def gravity_torque(self, theta: float) -> float:
         return -self.params.gravity_term() * math.sin(theta)
 
+    def required_torque(self, alpha: float, theta: float) -> Tuple[float, float]:
+        """Retourne le couple moteur nécessaire pour imposer une accélération donnée.
+
+        Le modèle est volontairement simplifié : on considère uniquement l'inertie
+        totale du bras et le couple gravitationnel instantané. Aucun frottement ni
+        autre dissipation n'est pris en compte. Le résultat correspond donc au
+        couple à appliquer pour obtenir exactement ``alpha`` en présence de la
+        gravité actuelle.
+        """
+
+        tau_g = self.gravity_torque(theta)
+        torque = self.params.inertia() * alpha - tau_g
+        return torque, tau_g
+
     def compute_alpha(self, couple_moteur: float, theta: float, omega: float) -> Tuple[float, float]:
         tau_g = self.gravity_torque(theta)
         alpha = (couple_moteur + tau_g) / self.params.inertia()
