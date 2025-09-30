@@ -1562,7 +1562,8 @@ class Application:
             self.set_message(f"Erreur export : {exc}", success=False)
 
     def on_generate_table(self, request: TableRequest) -> Tuple[bool, str, List[str], List[Dict[str, object]]]:
-        rows: List[Dict[str, object]] = []
+        preview_rows: List[Dict[str, object]] = []
+        table_blocks: List[Tuple[float, List[Dict[str, object]]]] = []
         columns = [
             "parameter_label",
             "parameter_value",
@@ -1600,10 +1601,14 @@ class Application:
                 message = f"Aucune donnée générée pour {request.parameter_label}={value:.4g}"
                 self.set_message(message, success=False)
                 return False, message, [], []
-            rows.extend(self._rows_from_log_for_table(request, value, simulation.log))
+            rows_for_value = self._rows_from_log_for_table(request, value, simulation.log)
+            table_blocks.append((value, rows_for_value))
+            preview_rows.extend(rows_for_value)
 
         try:
-            file_path = self._write_table_file(request.filename, columns, rows)
+            file_path = self._write_table_file(
+                request.filename, request.parameter_label, columns, table_blocks
+            )
         except OSError as exc:
             message = f"Erreur écriture tableau : {exc}"
             self.set_message(message, success=False)
@@ -1611,7 +1616,7 @@ class Application:
 
         message = f"Tableau exporté vers {file_path}"
         self.set_message(message, success=True)
-        return True, message, columns, rows
+        return True, message, columns, preview_rows
 
     def _rows_from_log_for_table(
         self,
@@ -1636,7 +1641,13 @@ class Application:
             )
         return rows
 
-    def _write_table_file(self, filename: str, columns: List[str], rows: List[Dict[str, object]]) -> str:
+    def _write_table_file(
+        self,
+        filename: str,
+        parameter_label: str,
+        columns: List[str],
+        table_blocks: List[Tuple[float, List[Dict[str, object]]]],
+    ) -> str:
         os.makedirs(TABLE_EXPORT_DIR, exist_ok=True)
         sanitized = filename.strip() or "tableau"
         allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
@@ -1647,17 +1658,27 @@ class Application:
             sanitized += ".csv"
         path = os.path.join(TABLE_EXPORT_DIR, sanitized)
         with open(path, "w", newline="", encoding="utf-8") as fp:
-            writer = csv.DictWriter(fp, fieldnames=columns)
-            writer.writeheader()
-            for row in rows:
-                formatted_row: Dict[str, object] = {}
-                for key in columns:
-                    value = row.get(key, "")
-                    if isinstance(value, (int, float)):
-                        formatted_row[key] = f"{value:.2f}"
-                    else:
-                        formatted_row[key] = value
-                writer.writerow(formatted_row)
+            writer = csv.writer(fp)
+            column_count = len(columns)
+            for index, (value, rows) in enumerate(table_blocks):
+                if index > 0:
+                    writer.writerow([])
+                summary_row: List[str] = [""] * column_count
+                if column_count >= 1:
+                    summary_row[0] = parameter_label
+                if column_count >= 2:
+                    summary_row[1] = f"{value:.2f}"
+                writer.writerow(summary_row)
+                writer.writerow(columns)
+                for row in rows:
+                    formatted_row: List[str] = []
+                    for key in columns:
+                        cell = row.get(key, "")
+                        if isinstance(cell, (int, float)):
+                            formatted_row.append(f"{cell:.2f}")
+                        else:
+                            formatted_row.append(str(cell))
+                    writer.writerow(formatted_row)
         return path
 
     def on_pause(self):
