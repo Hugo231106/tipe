@@ -16,12 +16,13 @@ Pour les environnements sans affichage (tests automatiques) :
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import math
 import os
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import pygame
@@ -42,6 +43,7 @@ PANEL_MARGIN = 10
 FONT_NAME = "freesansbold.ttf"
 CONFIG_PATH = "config.json"
 EXPORT_PATH = "export.csv"
+TABLE_EXPORT_DIR = "tables"
 
 BACKGROUND_COLOR = (15, 18, 26)
 PANEL_BG = (28, 31, 40)
@@ -882,6 +884,181 @@ class ParameterEditor:
         elif self.success_message:
             msg = self.font.render(self.success_message, True, SUCCESS_COLOR)
             surface.blit(msg, (self.area.x + 10, self.area.bottom - 60))
+
+
+@dataclass
+class TableRequest:
+    parameter_key: str
+    parameter_label: str
+    values: List[float]
+    filename: str
+
+
+class TableGeneratorPanel:
+    def __init__(
+        self,
+        font: pygame.font.Font,
+        params: ArmParameters,
+        area: pygame.Rect,
+        on_generate: Callable[[TableRequest], Tuple[bool, str, List[str], List[Dict[str, object]]]],
+    ):
+        self.font = font
+        self.params = params
+        self.area = area
+        self.on_generate = on_generate
+        self.status_message = ""
+        self.status_success = True
+        self.preview_lines: List[str] = []
+        self.param_options: List[Tuple[str, str]] = [
+            ("Angle départ (deg)", "start_angle_deg"),
+            ("Angle arrivée (deg)", "target_angle_deg"),
+            ("Longueur (m)", "length"),
+            ("Masse bras (kg)", "mass_arm"),
+            ("Masse charge (kg)", "mass_load"),
+            ("Gravité (m/s²)", "gravity"),
+            ("Durée cible (s)", "target_duration"),
+            ("Max vitesse (rad/s)", "max_velocity"),
+            ("Max accélération (rad/s²)", "max_acceleration"),
+            ("Max couple (N·m)", "max_torque"),
+        ]
+        self.param_map = {label: key for label, key in self.param_options}
+        dropdown_rect = pygame.Rect(self.area.x + 12, self.area.y + 48, 300, 32)
+        self.param_dropdown = Dropdown(
+            dropdown_rect,
+            [label for label, _ in self.param_options],
+            self.param_options[0][0],
+            self.font,
+            on_change=self._on_param_change,
+        )
+        input_width = 200
+        first_rect = pygame.Rect(self.area.x + 12, dropdown_rect.bottom + 40, input_width, 32)
+        second_rect = pygame.Rect(first_rect.right + 16, first_rect.y, input_width, 32)
+        count_rect = pygame.Rect(self.area.x + 12, first_rect.bottom + 36, input_width, 32)
+        file_rect = pygame.Rect(second_rect.x, count_rect.y, input_width, 32)
+        self.first_input = TextInput(first_rect, "0.0", self.font)
+        self.second_input = TextInput(second_rect, "0.0", self.font)
+        self.count_input = TextInput(count_rect, "5", self.font)
+        self.filename_input = TextInput(file_rect, "tableau", self.font)
+        self.inputs = [self.first_input, self.second_input, self.count_input, self.filename_input]
+        button_rect = pygame.Rect(self.area.x + 12, count_rect.bottom + 40, 180, 40)
+        self.generate_button = Button(button_rect, "Générer", self._request_generation, self.font)
+        self._update_inputs_for_param(self.param_options[0][0])
+
+    def sync_params(self, params: ArmParameters):
+        self.params = params
+        self._update_inputs_for_param(self.param_dropdown.value)
+
+    def clear_status(self):
+        self.status_message = ""
+        self.preview_lines = []
+
+    def _on_param_change(self, label: str):
+        self._update_inputs_for_param(label)
+
+    def _update_inputs_for_param(self, label: str):
+        key = self.param_map[label]
+        value = getattr(self.params, key, 0.0)
+        formatted = f"{value:.6g}"
+        self.first_input.text = formatted
+        if self.second_input.text.strip() == "" or self.second_input.text == self.first_input.text:
+            try:
+                increment = value * 0.1 if value != 0 else 1.0
+                self.second_input.text = f"{(value + increment):.6g}"
+            except TypeError:
+                self.second_input.text = formatted
+
+    def _request_generation(self):
+        request = self._build_request()
+        if not request:
+            return
+        if not self.on_generate:
+            return
+        success, message, columns, rows = self.on_generate(request)
+        self.status_message = message
+        self.status_success = success
+        if success:
+            preview = []
+            for row in rows[: min(6, len(rows))]:
+                preview.append(
+                    f"{request.parameter_label}={row.get('parameter_value', 0.0):.4g} | "
+                    f"couple={row.get('max_couple_moteur', 0.0):.4g} | "
+                    f"omega={row.get('max_omega', 0.0):.4g} | "
+                    f"ax={row.get('max_ax', 0.0):.4g} | ay={row.get('max_ay', 0.0):.4g}"
+                )
+            self.preview_lines = preview
+        else:
+            self.preview_lines = []
+
+    def _build_request(self) -> Optional[TableRequest]:
+        label = self.param_dropdown.value
+        key = self.param_map[label]
+        try:
+            first = float(self.first_input.text.strip())
+            second = float(self.second_input.text.strip())
+            count = int(float(self.count_input.text.strip()))
+        except ValueError:
+            self.status_message = "Valeurs numériques invalides"
+            self.status_success = False
+            return None
+        if count <= 0:
+            self.status_message = "Nombre de lignes doit être positif"
+            self.status_success = False
+            return None
+        filename = self.filename_input.text.strip() or "tableau"
+        if count == 1:
+            values = [first]
+        else:
+            step = second - first
+            values = [first + i * step for i in range(count)]
+        return TableRequest(
+            parameter_key=key,
+            parameter_label=label,
+            values=values,
+            filename=filename,
+        )
+
+    def handle_event(self, event: pygame.event.Event):
+        self.param_dropdown.handle_event(event)
+        for widget in self.inputs:
+            widget.handle_event(event)
+        self.generate_button.handle_event(event)
+
+    def draw(self, surface: pygame.Surface):
+        pygame.draw.rect(surface, PANEL_BG, self.area)
+        title = self.font.render("Générateur de tableau", True, TEXT_COLOR)
+        surface.blit(title, (self.area.x + 12, self.area.y + 12))
+        instruction = self.font.render(
+            "Choisissez un paramètre et définissez deux valeurs successives.", True, TEXT_COLOR
+        )
+        surface.blit(instruction, (self.area.x + 12, self.area.y + 24 + title.get_height()))
+        label_param = self.font.render("Paramètre à balayer", True, TEXT_COLOR)
+        surface.blit(label_param, (self.param_dropdown.rect.x, self.param_dropdown.rect.y - 24))
+        self.param_dropdown.draw(surface)
+        label_values = self.font.render("Valeurs 1 et 2", True, TEXT_COLOR)
+        surface.blit(label_values, (self.first_input.rect.x, self.first_input.rect.y - 24))
+        for widget in self.inputs:
+            widget.draw(surface)
+        count_label = self.font.render("Nombre de lignes", True, TEXT_COLOR)
+        surface.blit(count_label, (self.count_input.rect.x, self.count_input.rect.y - 24))
+        file_label = self.font.render("Nom du fichier", True, TEXT_COLOR)
+        surface.blit(file_label, (self.filename_input.rect.x, self.filename_input.rect.y - 24))
+        self.generate_button.draw(surface)
+        status_color = SUCCESS_COLOR if self.status_success else ERROR_COLOR
+        status_height = 0
+        if self.status_message:
+            status = self.font.render(self.status_message, True, status_color)
+            surface.blit(status, (self.area.x + 12, self.generate_button.rect.bottom + 12))
+            status_height = status.get_height() + 6
+        if self.preview_lines:
+            preview_title = self.font.render("Aperçu (max 6 lignes)", True, TEXT_COLOR)
+            y = self.generate_button.rect.bottom + 12 + status_height
+            surface.blit(preview_title, (self.area.x + 12, y))
+            y += preview_title.get_height() + 6
+            for line in self.preview_lines:
+                text = self.font.render(line, True, TEXT_COLOR)
+                surface.blit(text, (self.area.x + 12, y))
+                y += text.get_height() + 2
+
 class PlotPanel:
     def __init__(self, area: pygame.Rect, font: pygame.font.Font):
         self.area = area
@@ -1211,6 +1388,13 @@ class Application:
             self.window_height - TOOLBAR_HEIGHT - 20,
         )
         self.editor = ParameterEditor(self.small_font, self.params, editor_area)
+        self.table_panel = TableGeneratorPanel(
+            self.small_font,
+            self.params,
+            editor_area,
+            on_generate=self.on_generate_table,
+        )
+        self.previous_mode = "run"
         self.create_toolbar()
         self.recompute_trajectory(initial=True, start_after=False)
 
@@ -1256,6 +1440,7 @@ class Application:
         x = dropdown_rect.right + 12
         labels = [
             ("Modifier", self.toggle_mode),
+            ("Tableau", self.toggle_table_mode),
             ("Lancer", self.on_launch),
             ("Réinitialiser", self.on_reset),
             ("Exporter", self.on_export),
@@ -1284,6 +1469,15 @@ class Application:
             self.modifier_dropdown.open = False
 
     def toggle_mode(self):
+        if self.mode == "table":
+            self.mode = "edit"
+            self.table_panel.sync_params(self.params)
+            self.table_panel.clear_status()
+            self.editor.update_from_params()
+            self.editor.clear_highlight()
+            self.simulation.paused = True
+            self.set_message("Mode édition actif", success=True)
+            return
         if self.mode == "run":
             self.mode = "edit"
             self.editor.update_from_params()
@@ -1298,12 +1492,48 @@ class Application:
                 self.planner = TrajectoryPlanner(self.params)
                 try:
                     self.recompute_trajectory(start_after=False)
+                    self.table_panel.sync_params(self.params)
                     self.set_message("Retour mode simulation", success=True)
                 except TrajectoryError as exc:
                     self.mode = "edit"
                     self.set_message(str(exc), success=False)
             else:
                 self.set_message(self.editor.error_message, success=False)
+
+    def toggle_table_mode(self):
+        if self.mode == "table":
+            self.mode = self.previous_mode if self.previous_mode in ("run", "edit") else "run"
+            if self.mode == "edit":
+                self.editor.update_from_params()
+                self.editor.clear_highlight()
+                self.simulation.paused = True
+            else:
+                self.simulation.paused = False
+            self.table_panel.clear_status()
+            self.set_message("Mode tableau fermé", success=True)
+            return
+
+        if self.mode == "edit":
+            if not self.editor.apply_changes():
+                self.set_message(self.editor.error_message, success=False)
+                return
+            self.editor.clear_highlight()
+            self.simulation.update_parameters(self.params)
+            self.planner = TrajectoryPlanner(self.params)
+            try:
+                self.recompute_trajectory(start_after=False)
+            except TrajectoryError as exc:
+                self.mode = "edit"
+                self.set_message(str(exc), success=False)
+                return
+            self.mode = "run"
+            self.set_message("Paramètres appliqués", success=True)
+
+        self.previous_mode = self.mode
+        self.mode = "table"
+        self.simulation.paused = True
+        self.table_panel.sync_params(self.params)
+        self.set_message("Mode tableau actif", success=True)
 
     def on_launch(self):
         try:
@@ -1330,6 +1560,127 @@ class Application:
         except OSError as exc:
             self.set_message(f"Erreur export : {exc}", success=False)
 
+    def on_generate_table(self, request: TableRequest) -> Tuple[bool, str, List[str], List[Dict[str, object]]]:
+        rows: List[Dict[str, object]] = []
+        columns = [
+            "parameter_label",
+            "parameter_value",
+            "duration",
+            "max_theta_deg",
+            "max_theta_ref_deg",
+            "max_omega",
+            "max_omega_ref",
+            "max_alpha",
+            "max_alpha_ref",
+            "max_couple_moteur",
+            "max_couple_total",
+            "max_couple_gravite",
+            "max_power",
+            "max_vx",
+            "max_vy",
+            "max_ax",
+            "max_ay",
+            "max_x",
+            "max_y",
+            "final_theta_deg",
+            "final_omega",
+            "final_couple_moteur",
+        ]
+        for value in request.values:
+            sweep_params = replace(self.params)
+            setattr(sweep_params, request.parameter_key, value)
+            if request.parameter_key in {"max_velocity", "max_acceleration", "max_torque"}:
+                sweep_params.auto_limits = False
+            sweep_params.update_auto_limits()
+            planner = TrajectoryPlanner(sweep_params)
+            try:
+                profile = planner.plan()
+            except TrajectoryError as exc:
+                message = f"Trajectoire impossible pour {request.parameter_label}={value:.4g} : {exc}"
+                self.set_message(message, success=False)
+                return False, message, [], []
+            simulation = ArmSimulation(sweep_params)
+            simulation.set_trajectory(profile)
+            simulation.start()
+            dt = 1.0 / PHYSICS_HZ
+            max_steps = max(1, int(profile.duration / dt) + PHYSICS_HZ * 2)
+            for _ in range(max_steps):
+                simulation.physics_step(dt)
+                if not simulation.running:
+                    break
+            if not simulation.log:
+                message = f"Aucune donnée générée pour {request.parameter_label}={value:.4g}"
+                self.set_message(message, success=False)
+                return False, message, [], []
+            rows.append(self._summarize_log_for_table(request, value, simulation.log, profile.duration))
+
+        try:
+            file_path = self._write_table_file(request.filename, columns, rows)
+        except OSError as exc:
+            message = f"Erreur écriture tableau : {exc}"
+            self.set_message(message, success=False)
+            return False, message, [], []
+
+        message = f"Tableau exporté vers {file_path}"
+        self.set_message(message, success=True)
+        return True, message, columns, rows
+
+    def _summarize_log_for_table(
+        self,
+        request: TableRequest,
+        value: float,
+        log: List[LogEntry],
+        duration: float,
+    ) -> Dict[str, object]:
+        def max_abs(attr: str) -> float:
+            return max(abs(getattr(entry, attr)) for entry in log)
+
+        def max_abs_deg(attr: str) -> float:
+            return max(abs(math.degrees(getattr(entry, attr))) for entry in log)
+
+        final = log[-1]
+        return {
+            "parameter_label": request.parameter_label,
+            "parameter_value": value,
+            "duration": duration,
+            "max_theta_deg": max_abs_deg("theta"),
+            "max_theta_ref_deg": max_abs_deg("theta_ref"),
+            "max_omega": max_abs("omega"),
+            "max_omega_ref": max_abs("omega_ref"),
+            "max_alpha": max_abs("alpha"),
+            "max_alpha_ref": max_abs("alpha_ref"),
+            "max_couple_moteur": max_abs("couple_moteur"),
+            "max_couple_total": max_abs("couple_total"),
+            "max_couple_gravite": max_abs("couple_gravite"),
+            "max_power": max_abs("power"),
+            "max_vx": max_abs("vx"),
+            "max_vy": max_abs("vy"),
+            "max_ax": max_abs("ax"),
+            "max_ay": max_abs("ay"),
+            "max_x": max(abs(entry.x) for entry in log),
+            "max_y": max(abs(entry.y) for entry in log),
+            "final_theta_deg": math.degrees(final.theta),
+            "final_omega": final.omega,
+            "final_couple_moteur": final.couple_moteur,
+        }
+
+    def _write_table_file(self, filename: str, columns: List[str], rows: List[Dict[str, object]]) -> str:
+        os.makedirs(TABLE_EXPORT_DIR, exist_ok=True)
+        sanitized = filename.strip() or "tableau"
+        allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
+        sanitized = "".join(ch for ch in sanitized if ch in allowed or ch == ".")
+        if not sanitized:
+            sanitized = "tableau"
+        if not sanitized.endswith(".csv"):
+            sanitized += ".csv"
+        path = os.path.join(TABLE_EXPORT_DIR, sanitized)
+        with open(path, "w", newline="", encoding="utf-8") as fp:
+            writer = csv.DictWriter(fp, fieldnames=columns)
+            writer.writeheader()
+            for row in rows:
+                writer.writerow({key: row.get(key, "") for key in columns})
+        return path
+
     def on_pause(self):
         self.simulation.toggle_pause()
         self.set_message("Pause" if self.simulation.paused else "Lecture", success=True)
@@ -1353,6 +1704,7 @@ class Application:
         self.planner = TrajectoryPlanner(self.params)
         self.editor.params = self.params
         self.editor.update_from_params()
+        self.table_panel.sync_params(self.params)
         try:
             self.recompute_trajectory(start_after=False)
             self.set_message("Configuration chargée", success=True)
@@ -1397,6 +1749,8 @@ class Application:
                     button.handle_event(event)
             if self.mode == "edit":
                 self.editor.handle_event(event)
+            elif self.mode == "table":
+                self.table_panel.handle_event(event)
             else:
                 self.plot_panel.handle_event(event)
         return True
@@ -1427,6 +1781,8 @@ class Application:
         self.sim_renderer.draw(self.screen, self.simulation)
         if self.mode == "edit":
             self.editor.draw(self.screen)
+        elif self.mode == "table":
+            self.table_panel.draw(self.screen)
         else:
             self.plot_panel.draw(self.screen)
         pygame.display.flip()
