@@ -981,9 +981,10 @@ class TableGeneratorPanel:
             for row in rows[: min(6, len(rows))]:
                 preview.append(
                     f"{request.parameter_label}={row.get('parameter_value', 0.0):.4g} | "
-                    f"couple={row.get('max_couple_moteur', 0.0):.4g} | "
-                    f"omega={row.get('max_omega', 0.0):.4g} | "
-                    f"ax={row.get('max_ax', 0.0):.4g} | ay={row.get('max_ay', 0.0):.4g}"
+                    f"t={row.get('time', 0.0):.4g}s | "
+                    f"angle={row.get('theta_deg', 0.0):.4g}° | "
+                    f"omega={row.get('omega', 0.0):.4g} | ax={row.get('ax', 0.0):.4g} | "
+                    f"ay={row.get('ay', 0.0):.4g}"
                 )
             self.preview_lines = preview
         else:
@@ -994,7 +995,7 @@ class TableGeneratorPanel:
         key = self.param_map[label]
         try:
             first = float(self.first_input.text.strip())
-            second = float(self.second_input.text.strip())
+            last = float(self.second_input.text.strip())
             count = int(float(self.count_input.text.strip()))
         except ValueError:
             self.status_message = "Valeurs numériques invalides"
@@ -1008,7 +1009,7 @@ class TableGeneratorPanel:
         if count == 1:
             values = [first]
         else:
-            step = second - first
+            step = (last - first) / (count - 1)
             values = [first + i * step for i in range(count)]
         return TableRequest(
             parameter_key=key,
@@ -1028,13 +1029,13 @@ class TableGeneratorPanel:
         title = self.font.render("Générateur de tableau", True, TEXT_COLOR)
         surface.blit(title, (self.area.x + 12, self.area.y + 12))
         instruction = self.font.render(
-            "Choisissez un paramètre et définissez deux valeurs successives.", True, TEXT_COLOR
+            "Choisissez un paramètre et définissez deux valeurs de début et fin.", True, TEXT_COLOR
         )
         surface.blit(instruction, (self.area.x + 12, self.area.y + 24 + title.get_height()))
         label_param = self.font.render("Paramètre à balayer", True, TEXT_COLOR)
         surface.blit(label_param, (self.param_dropdown.rect.x, self.param_dropdown.rect.y - 24))
         self.param_dropdown.draw(surface)
-        label_values = self.font.render("Valeurs 1 et 2", True, TEXT_COLOR)
+        label_values = self.font.render("Valeurs début et fin", True, TEXT_COLOR)
         surface.blit(label_values, (self.first_input.rect.x, self.first_input.rect.y - 24))
         for widget in self.inputs:
             widget.draw(surface)
@@ -1565,26 +1566,26 @@ class Application:
         columns = [
             "parameter_label",
             "parameter_value",
-            "duration",
-            "max_theta_deg",
-            "max_theta_ref_deg",
-            "max_omega",
-            "max_omega_ref",
-            "max_alpha",
-            "max_alpha_ref",
-            "max_couple_moteur",
-            "max_couple_total",
-            "max_couple_gravite",
-            "max_power",
-            "max_vx",
-            "max_vy",
-            "max_ax",
-            "max_ay",
-            "max_x",
-            "max_y",
-            "final_theta_deg",
-            "final_omega",
-            "final_couple_moteur",
+            "time",
+            "theta",
+            "theta_deg",
+            "theta_ref",
+            "theta_ref_deg",
+            "omega",
+            "omega_ref",
+            "alpha",
+            "alpha_ref",
+            "couple_moteur",
+            "couple_gravite",
+            "couple_total",
+            "power",
+            "x",
+            "y",
+            "z",
+            "vx",
+            "vy",
+            "ax",
+            "ay",
         ]
         for value in request.values:
             sweep_params = replace(self.params)
@@ -1612,7 +1613,7 @@ class Application:
                 message = f"Aucune donnée générée pour {request.parameter_label}={value:.4g}"
                 self.set_message(message, success=False)
                 return False, message, [], []
-            rows.append(self._summarize_log_for_table(request, value, simulation.log, profile.duration))
+            rows.extend(self._rows_from_log_for_table(request, value, simulation.log))
 
         try:
             file_path = self._write_table_file(request.filename, columns, rows)
@@ -1625,44 +1626,41 @@ class Application:
         self.set_message(message, success=True)
         return True, message, columns, rows
 
-    def _summarize_log_for_table(
+    def _rows_from_log_for_table(
         self,
         request: TableRequest,
         value: float,
         log: List[LogEntry],
-        duration: float,
-    ) -> Dict[str, object]:
-        def max_abs(attr: str) -> float:
-            return max(abs(getattr(entry, attr)) for entry in log)
-
-        def max_abs_deg(attr: str) -> float:
-            return max(abs(math.degrees(getattr(entry, attr))) for entry in log)
-
-        final = log[-1]
-        return {
-            "parameter_label": request.parameter_label,
-            "parameter_value": value,
-            "duration": duration,
-            "max_theta_deg": max_abs_deg("theta"),
-            "max_theta_ref_deg": max_abs_deg("theta_ref"),
-            "max_omega": max_abs("omega"),
-            "max_omega_ref": max_abs("omega_ref"),
-            "max_alpha": max_abs("alpha"),
-            "max_alpha_ref": max_abs("alpha_ref"),
-            "max_couple_moteur": max_abs("couple_moteur"),
-            "max_couple_total": max_abs("couple_total"),
-            "max_couple_gravite": max_abs("couple_gravite"),
-            "max_power": max_abs("power"),
-            "max_vx": max_abs("vx"),
-            "max_vy": max_abs("vy"),
-            "max_ax": max_abs("ax"),
-            "max_ay": max_abs("ay"),
-            "max_x": max(abs(entry.x) for entry in log),
-            "max_y": max(abs(entry.y) for entry in log),
-            "final_theta_deg": math.degrees(final.theta),
-            "final_omega": final.omega,
-            "final_couple_moteur": final.couple_moteur,
-        }
+    ) -> List[Dict[str, object]]:
+        rows: List[Dict[str, object]] = []
+        for entry in log:
+            rows.append(
+                {
+                    "parameter_label": request.parameter_label,
+                    "parameter_value": value,
+                    "time": entry.t,
+                    "theta": entry.theta,
+                    "theta_deg": math.degrees(entry.theta),
+                    "theta_ref": entry.theta_ref,
+                    "theta_ref_deg": math.degrees(entry.theta_ref),
+                    "omega": entry.omega,
+                    "omega_ref": entry.omega_ref,
+                    "alpha": entry.alpha,
+                    "alpha_ref": entry.alpha_ref,
+                    "couple_moteur": entry.couple_moteur,
+                    "couple_gravite": entry.couple_gravite,
+                    "couple_total": entry.couple_total,
+                    "power": entry.power,
+                    "x": entry.x,
+                    "y": entry.y,
+                    "z": entry.z,
+                    "vx": entry.vx,
+                    "vy": entry.vy,
+                    "ax": entry.ax,
+                    "ay": entry.ay,
+                }
+            )
+        return rows
 
     def _write_table_file(self, filename: str, columns: List[str], rows: List[Dict[str, object]]) -> str:
         os.makedirs(TABLE_EXPORT_DIR, exist_ok=True)
