@@ -22,8 +22,10 @@ import math
 import os
 import sys
 import time
+from xml.sax.saxutils import escape
+from zipfile import ZIP_DEFLATED, ZipFile
 from dataclasses import dataclass, replace
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 import pygame
 
@@ -1654,22 +1656,54 @@ class Application:
         sanitized = "".join(ch for ch in sanitized if ch in allowed or ch == ".")
         if not sanitized:
             sanitized = "tableau"
-        if not sanitized.endswith(".csv"):
-            sanitized += ".csv"
+        if sanitized.lower().endswith(".csv"):
+            extension = ".csv"
+        elif sanitized.lower().endswith(".xlsx"):
+            extension = ".xlsx"
+        else:
+            sanitized += ".xlsx"
+            extension = ".xlsx"
         path = os.path.join(TABLE_EXPORT_DIR, sanitized)
-        with open(path, "w", newline="", encoding="utf-8") as fp:
-            writer = csv.writer(fp)
-            column_count = len(columns)
-            for index, (value, rows) in enumerate(table_blocks):
-                if index > 0:
-                    writer.writerow([])
-                summary_row: List[str] = [""] * column_count
-                if column_count >= 1:
-                    summary_row[0] = parameter_label
-                if column_count >= 2:
-                    summary_row[1] = f"{value:.2f}"
-                writer.writerow(summary_row)
-                writer.writerow(columns)
+        if extension == ".csv":
+            with open(path, "w", newline="", encoding="utf-8") as fp:
+                writer = csv.writer(fp)
+                column_count = len(columns)
+                for index, (value, rows) in enumerate(table_blocks):
+                    if index > 0:
+                        writer.writerow([])
+                    summary_row: List[str] = [""] * column_count
+                    if column_count >= 1:
+                        summary_row[0] = parameter_label
+                    if column_count >= 2:
+                        summary_row[1] = f"{value:.2f}"
+                    writer.writerow(summary_row)
+                    writer.writerow(columns)
+                    for row in rows:
+                        formatted_row: List[str] = []
+                        for key in columns:
+                            cell = row.get(key, "")
+                            if isinstance(cell, (int, float)):
+                                formatted_row.append(f"{cell:.2f}")
+                            else:
+                                formatted_row.append(str(cell))
+                        writer.writerow(formatted_row)
+        else:
+            sheets: List[Tuple[str, List[List[str]]]] = []
+            existing_names: Set[str] = set()
+            for value, rows in table_blocks:
+                sheet_name = self._sanitize_sheet_name(
+                    f"{parameter_label}={value:.2f}", existing_names
+                )
+                column_count = len(columns)
+                summary_row: List[str] = [""] * max(column_count, 2)
+                summary_row[0] = parameter_label
+                summary_row[1] = f"{value:.2f}"
+                if column_count > 0:
+                    summary_display = summary_row[:column_count]
+                else:
+                    summary_display = summary_row
+                formatted_rows: List[List[str]] = [summary_display]
+                formatted_rows.append(list(columns))
                 for row in rows:
                     formatted_row: List[str] = []
                     for key in columns:
@@ -1678,8 +1712,121 @@ class Application:
                             formatted_row.append(f"{cell:.2f}")
                         else:
                             formatted_row.append(str(cell))
-                    writer.writerow(formatted_row)
+                    formatted_rows.append(formatted_row)
+                sheets.append((sheet_name, formatted_rows))
+            self._write_xlsx(path, sheets)
         return path
+
+    def _sanitize_sheet_name(self, name: str, existing: Set[str]) -> str:
+        invalid = "[]:*?/\\"
+        sanitized = "".join("_" if ch in invalid else ch for ch in name)
+        sanitized = sanitized.strip()
+        if not sanitized:
+            sanitized = "Feuille"
+        if len(sanitized) > 31:
+            sanitized = sanitized[:31]
+        base = sanitized
+        counter = 1
+        while sanitized in existing:
+            suffix = f"_{counter}"
+            sanitized = f"{base[: max(0, 31 - len(suffix))]}{suffix}" or f"Feuille_{counter}"
+            counter += 1
+        existing.add(sanitized)
+        return sanitized
+
+    def _write_xlsx(self, path: str, sheets: List[Tuple[str, List[List[str]]]]):
+        if not sheets:
+            raise ValueError("Aucune donnée à écrire dans le classeur")
+        with ZipFile(path, "w", ZIP_DEFLATED) as archive:
+            archive.writestr("[Content_Types].xml", self._xlsx_content_types(len(sheets)))
+            archive.writestr("_rels/.rels", self._xlsx_root_rels())
+            archive.writestr("xl/workbook.xml", self._xlsx_workbook_xml(sheets))
+            archive.writestr("xl/_rels/workbook.xml.rels", self._xlsx_workbook_rels(len(sheets)))
+            for index, (_, rows) in enumerate(sheets, start=1):
+                archive.writestr(
+                    f"xl/worksheets/sheet{index}.xml",
+                    self._xlsx_sheet_xml(rows),
+                )
+
+    def _xlsx_content_types(self, sheet_count: int) -> str:
+        overrides = [
+            '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>',
+        ]
+        for index in range(1, sheet_count + 1):
+            overrides.append(
+                f'<Override PartName="/xl/worksheets/sheet{index}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+            )
+        parts = "".join(overrides)
+        return (
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+            "<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">"
+            "<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>"
+            "<Default Extension=\"xml\" ContentType=\"application/xml\"/>"
+            f"{parts}" "</Types>"
+        )
+
+    def _xlsx_root_rels(self) -> str:
+        return (
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+            "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">"
+            "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"xl/workbook.xml\"/>"
+            "</Relationships>"
+        )
+
+    def _xlsx_workbook_xml(self, sheets: List[Tuple[str, List[List[str]]]]) -> str:
+        sheet_entries = []
+        for index, (name, _) in enumerate(sheets, start=1):
+            sheet_entries.append(
+                f'<sheet name="{escape(name)}" sheetId="{index}" r:id="rId{index}"/>'
+            )
+        sheets_xml = "".join(sheet_entries)
+        return (
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+            "<workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" "
+            "xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">"
+            f"<sheets>{sheets_xml}</sheets>"
+            "</workbook>"
+        )
+
+    def _xlsx_workbook_rels(self, sheet_count: int) -> str:
+        relationships = []
+        for index in range(1, sheet_count + 1):
+            relationships.append(
+                f'<Relationship Id=\"rId{index}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet{index}.xml\"/>'
+            )
+        relations_xml = "".join(relationships)
+        return (
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+            "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">"
+            f"{relations_xml}" "</Relationships>"
+        )
+
+    def _xlsx_sheet_xml(self, rows: List[List[str]]) -> str:
+        lines = [
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>",
+            "<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">",
+            "<sheetData>",
+        ]
+        for row_index, row in enumerate(rows, start=1):
+            lines.append(f'<row r="{row_index}">')
+            for column_index, value in enumerate(row, start=1):
+                column_letter = self._xlsx_column_letter(column_index)
+                cell_ref = f"{column_letter}{row_index}"
+                text = escape(str(value)) if value is not None else ""
+                lines.append(
+                    f'<c r="{cell_ref}" t="inlineStr"><is><t>{text}</t></is></c>'
+                )
+            lines.append("</row>")
+        lines.extend(["</sheetData>", "</worksheet>"])
+        return "".join(lines)
+
+    def _xlsx_column_letter(self, index: int) -> str:
+        result = ""
+        current = index
+        while current > 0:
+            current, remainder = divmod(current - 1, 26)
+            result = chr(65 + remainder) + result
+        return result or "A"
 
     def on_pause(self):
         self.simulation.toggle_pause()
