@@ -980,11 +980,11 @@ class TableGeneratorPanel:
             preview = []
             for row in rows[: min(6, len(rows))]:
                 preview.append(
-                    f"{request.parameter_label}={row.get('parameter_value', 0.0):.4g} | "
-                    f"t={row.get('time', 0.0):.4g}s | "
-                    f"angle={row.get('theta_deg', 0.0):.4g}° | "
-                    f"omega={row.get('omega', 0.0):.4g} | ax={row.get('ax', 0.0):.4g} | "
-                    f"ay={row.get('ay', 0.0):.4g}"
+                    f"{request.parameter_label}={row.get('parameter_value', 0.0):.2f} | "
+                    f"t={row.get('time', 0.0):.2f}s | "
+                    f"omega={row.get('omega', 0.0):.2f} | "
+                    f"alpha={row.get('alpha', 0.0):.2f} | "
+                    f"couple={row.get('couple_total', 0.0):.2f}"
                 )
             self.preview_lines = preview
         else:
@@ -1551,11 +1551,11 @@ class Application:
         try:
             with open(EXPORT_PATH, "w", encoding="utf-8") as fp:
                 fp.write(
-                    "time,theta,omega,alpha,theta_ref,omega_ref,alpha_ref,couple_moteur,couple_gravite,couple_total,power,x,y,vx,vy,ax,ay\n"
+                    "time,omega,alpha,couple_moteur,couple_gravite,couple_total,power\n"
                 )
                 for entry in self.simulation.log:
                     fp.write(
-                        f"{entry.t:.5f},{entry.theta:.6f},{entry.omega:.6f},{entry.alpha:.6f},{entry.theta_ref:.6f},{entry.omega_ref:.6f},{entry.alpha_ref:.6f},{entry.couple_moteur:.6f},{entry.couple_gravite:.6f},{entry.couple_total:.6f},{entry.power:.6f},{entry.x:.6f},{entry.y:.6f},{entry.vx:.6f},{entry.vy:.6f},{entry.ax:.6f},{entry.ay:.6f}\n"
+                        f"{entry.t:.2f},{entry.omega:.2f},{entry.alpha:.2f},{entry.couple_moteur:.2f},{entry.couple_gravite:.2f},{entry.couple_total:.2f},{entry.power:.2f}\n"
                     )
             self.set_message(f"Exporté vers {EXPORT_PATH}", success=True)
         except OSError as exc:
@@ -1567,25 +1567,12 @@ class Application:
             "parameter_label",
             "parameter_value",
             "time",
-            "theta",
-            "theta_deg",
-            "theta_ref",
-            "theta_ref_deg",
             "omega",
-            "omega_ref",
             "alpha",
-            "alpha_ref",
             "couple_moteur",
             "couple_gravite",
             "couple_total",
             "power",
-            "x",
-            "y",
-            "z",
-            "vx",
-            "vy",
-            "ax",
-            "ay",
         ]
         for value in request.values:
             sweep_params = replace(self.params)
@@ -1637,27 +1624,14 @@ class Application:
             rows.append(
                 {
                     "parameter_label": request.parameter_label,
-                    "parameter_value": value,
-                    "time": entry.t,
-                    "theta": entry.theta,
-                    "theta_deg": math.degrees(entry.theta),
-                    "theta_ref": entry.theta_ref,
-                    "theta_ref_deg": math.degrees(entry.theta_ref),
-                    "omega": entry.omega,
-                    "omega_ref": entry.omega_ref,
-                    "alpha": entry.alpha,
-                    "alpha_ref": entry.alpha_ref,
-                    "couple_moteur": entry.couple_moteur,
-                    "couple_gravite": entry.couple_gravite,
-                    "couple_total": entry.couple_total,
-                    "power": entry.power,
-                    "x": entry.x,
-                    "y": entry.y,
-                    "z": entry.z,
-                    "vx": entry.vx,
-                    "vy": entry.vy,
-                    "ax": entry.ax,
-                    "ay": entry.ay,
+                    "parameter_value": round(value, 2),
+                    "time": round(entry.t, 2),
+                    "omega": round(entry.omega, 2),
+                    "alpha": round(entry.alpha, 2),
+                    "couple_moteur": round(entry.couple_moteur, 2),
+                    "couple_gravite": round(entry.couple_gravite, 2),
+                    "couple_total": round(entry.couple_total, 2),
+                    "power": round(entry.power, 2),
                 }
             )
         return rows
@@ -1676,7 +1650,14 @@ class Application:
             writer = csv.DictWriter(fp, fieldnames=columns)
             writer.writeheader()
             for row in rows:
-                writer.writerow({key: row.get(key, "") for key in columns})
+                formatted_row: Dict[str, object] = {}
+                for key in columns:
+                    value = row.get(key, "")
+                    if isinstance(value, (int, float)):
+                        formatted_row[key] = f"{value:.2f}"
+                    else:
+                        formatted_row[key] = value
+                writer.writerow(formatted_row)
         return path
 
     def on_pause(self):
