@@ -85,7 +85,16 @@ class ArmModel:
         self.params = params
 
     def gravity_torque(self, theta: float) -> float:
-        return -self.params.gravity_term() * math.sin(theta)
+        """Compute the gravitational torque applied on the arm.
+
+        The reference configuration (``theta = 0``) corresponds to a horizontal
+        arm that is subject to the full gravitational torque. When the arm is
+        vertical the gravity torque should cancel out. Using the cosine ensures
+        a non-zero (negative) torque at ``theta = 0`` that goes to zero as the
+        arm approaches the vertical position (``theta = pi/2``).
+        """
+
+        return -self.params.gravity_term() * math.cos(theta)
 
     def required_torque(self, alpha: float, theta: float) -> Tuple[float, float]:
         """Retourne le couple moteur nécessaire pour imposer une accélération donnée.
