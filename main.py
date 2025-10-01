@@ -656,9 +656,13 @@ class Dropdown(Widget):
             if self.open:
                 self.open = False
                 return True
+        elif event.type == pygame.KEYDOWN:
+            if self.open and event.key in (pygame.K_ESCAPE, pygame.K_RETURN):
+                self.open = False
+                return True
         return False
 
-    def draw(self, surface: pygame.Surface):
+    def _draw_base(self, surface: pygame.Surface):
         pygame.draw.rect(surface, (80, 85, 100), self.rect, border_radius=4)
         text = self.font.render(self.value, True, TEXT_COLOR)
         text_rect = text.get_rect()
@@ -670,17 +674,27 @@ class Dropdown(Widget):
             (self.rect.right - 12, self.rect.centery + 4),
         ]
         pygame.draw.polygon(surface, TEXT_COLOR, arrow_points)
-        if self.open:
-            for i, option in enumerate(self.options):
-                opt_rect = pygame.Rect(
-                    self.rect.x,
-                    self.rect.y + (i + 1) * self.rect.height,
-                    self.rect.width,
-                    self.rect.height,
-                )
-                pygame.draw.rect(surface, (60, 60, 70), opt_rect, border_radius=4)
-                txt = self.font.render(option, True, TEXT_COLOR)
-                surface.blit(txt, txt.get_rect(center=opt_rect.center))
+
+    def draw(self, surface: pygame.Surface):
+        self._draw_base(surface)
+
+    def draw_overlay(self, surface: pygame.Surface):
+        if not self.open:
+            return
+        overlay = pygame.Surface(surface.get_size(), pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 160))
+        surface.blit(overlay, (0, 0))
+        self._draw_base(surface)
+        for i, option in enumerate(self.options):
+            opt_rect = pygame.Rect(
+                self.rect.x,
+                self.rect.y + (i + 1) * self.rect.height,
+                self.rect.width,
+                self.rect.height,
+            )
+            pygame.draw.rect(surface, (60, 60, 70), opt_rect, border_radius=4)
+            txt = self.font.render(option, True, TEXT_COLOR)
+            surface.blit(txt, txt.get_rect(center=opt_rect.center))
 class TextInput(Widget):
     def __init__(self, rect: pygame.Rect, text: str, font: pygame.font.Font):
         super().__init__(rect)
@@ -781,12 +795,24 @@ class ParameterEditor:
             if isinstance(widget, TextInput):
                 widget.text = f"{getattr(self.params, key)}"
 
-    def handle_event(self, event: pygame.event.Event):
+    def has_open_dropdown(self) -> bool:
+        return self.dropdown.open or self.manual_mode_dropdown.open
+
+    def handle_event(self, event: pygame.event.Event) -> bool:
+        if self.has_open_dropdown():
+            if self.dropdown.open:
+                self.dropdown.handle_event(event)
+            if self.manual_mode_dropdown.open:
+                self.manual_mode_dropdown.handle_event(event)
+            return True
+        if self.dropdown.handle_event(event):
+            return True
+        if self.manual_mode_dropdown.handle_event(event):
+            return True
         self.checkbox.handle_event(event)
-        self.dropdown.handle_event(event)
-        self.manual_mode_dropdown.handle_event(event)
         for widget in self.widgets.values():
             widget.handle_event(event)
+        return False
 
     def apply_changes(self) -> bool:
         try:
@@ -839,6 +865,10 @@ class ParameterEditor:
         self.highlight_key = None
         self.dropdown.open = False
         self.manual_mode_dropdown.open = False
+
+    def draw_overlays(self, surface: pygame.Surface):
+        self.dropdown.draw_overlay(surface)
+        self.manual_mode_dropdown.draw_overlay(surface)
 
     def draw(self, surface: pygame.Surface):
         if self.highlight_key and time.time() - self.highlight_time > 4.0:
@@ -984,9 +1014,10 @@ class TableGeneratorPanel:
                 preview.append(
                     f"{request.parameter_label}={row.get('parameter_value', 0.0):.2f} | "
                     f"t={row.get('time', 0.0):.2f}s | "
+                    f"theta={row.get('theta', 0.0):.2f}rad | "
                     f"omega={row.get('omega', 0.0):.2f} | "
                     f"alpha={row.get('alpha', 0.0):.2f} | "
-                    f"couple={row.get('couple_total', 0.0):.2f}"
+                    f"couple={row.get('couple_moteur', 0.0):.2f}"
                 )
             self.preview_lines = preview
         else:
@@ -1020,11 +1051,22 @@ class TableGeneratorPanel:
             filename=filename,
         )
 
-    def handle_event(self, event: pygame.event.Event):
-        self.param_dropdown.handle_event(event)
+    def has_open_dropdown(self) -> bool:
+        return self.param_dropdown.open
+
+    def handle_event(self, event: pygame.event.Event) -> bool:
+        if self.param_dropdown.open:
+            self.param_dropdown.handle_event(event)
+            return True
+        if self.param_dropdown.handle_event(event):
+            return True
         for widget in self.inputs:
             widget.handle_event(event)
         self.generate_button.handle_event(event)
+        return False
+
+    def draw_overlays(self, surface: pygame.Surface):
+        self.param_dropdown.draw_overlay(surface)
 
     def draw(self, surface: pygame.Surface):
         pygame.draw.rect(surface, PANEL_BG, self.area)
@@ -1553,11 +1595,11 @@ class Application:
         try:
             with open(EXPORT_PATH, "w", encoding="utf-8") as fp:
                 fp.write(
-                    "time,omega,alpha,couple_moteur,couple_gravite,couple_total,power\n"
+                    "time,theta,omega,alpha,couple_moteur,couple_gravite\n"
                 )
                 for entry in self.simulation.log:
                     fp.write(
-                        f"{entry.t:.2f},{entry.omega:.2f},{entry.alpha:.2f},{entry.couple_moteur:.2f},{entry.couple_gravite:.2f},{entry.couple_total:.2f},{entry.power:.2f}\n"
+                        f"{entry.t:.2f},{entry.theta:.2f},{entry.omega:.2f},{entry.alpha:.2f},{entry.couple_moteur:.2f},{entry.couple_gravite:.2f}\n"
                     )
             self.set_message(f"Exporté vers {EXPORT_PATH}", success=True)
         except OSError as exc:
@@ -1570,12 +1612,11 @@ class Application:
             "parameter_label",
             "parameter_value",
             "time",
+            "theta",
             "omega",
             "alpha",
             "couple_moteur",
             "couple_gravite",
-            "couple_total",
-            "power",
         ]
         for value in request.values:
             sweep_params = replace(self.params)
@@ -1633,12 +1674,11 @@ class Application:
                     "parameter_label": request.parameter_label,
                     "parameter_value": round(value, 2),
                     "time": round(entry.t, 2),
+                    "theta": round(entry.theta, 2),
                     "omega": round(entry.omega, 2),
                     "alpha": round(entry.alpha, 2),
                     "couple_moteur": round(entry.couple_moteur, 2),
                     "couple_gravite": round(entry.couple_gravite, 2),
-                    "couple_total": round(entry.couple_total, 2),
-                    "power": round(entry.power, 2),
                 }
             )
         return rows
@@ -1887,16 +1927,28 @@ class Application:
                     self.on_reset()
                 elif event.key == pygame.K_p:
                     self.on_pause()
+            toolbar_modal = any(dropdown.open for dropdown in self.toolbar_dropdowns)
+            if toolbar_modal:
+                for dropdown in self.toolbar_dropdowns:
+                    dropdown.handle_event(event)
+                continue
             dropdown_consumed = False
             for dropdown in self.toolbar_dropdowns:
                 if dropdown.handle_event(event):
                     dropdown_consumed = True
-            if not dropdown_consumed:
-                for button in self.toolbar_buttons:
-                    button.handle_event(event)
+            if dropdown_consumed:
+                continue
+            for button in self.toolbar_buttons:
+                button.handle_event(event)
             if self.mode == "edit":
+                if self.editor.has_open_dropdown():
+                    self.editor.handle_event(event)
+                    continue
                 self.editor.handle_event(event)
             elif self.mode == "table":
+                if self.table_panel.has_open_dropdown():
+                    self.table_panel.handle_event(event)
+                    continue
                 self.table_panel.handle_event(event)
             else:
                 self.plot_panel.handle_event(event)
@@ -1915,6 +1967,14 @@ class Application:
                 text = self.small_font.render(self.message, True, self.message_color)
                 self.screen.blit(text, (self.window_width - text.get_width() - 20, 20))
 
+    def draw_dropdown_modals(self):
+        for dropdown in self.toolbar_dropdowns:
+            dropdown.draw_overlay(self.screen)
+        if self.mode == "edit":
+            self.editor.draw_overlays(self.screen)
+        elif self.mode == "table":
+            self.table_panel.draw_overlays(self.screen)
+
     def update(self, dt: float):
         sub_steps = max(1, int(dt * PHYSICS_HZ))
         step_dt = dt / sub_steps
@@ -1932,6 +1992,7 @@ class Application:
             self.table_panel.draw(self.screen)
         else:
             self.plot_panel.draw(self.screen)
+        self.draw_dropdown_modals()
         pygame.display.flip()
 
     def run(self):
