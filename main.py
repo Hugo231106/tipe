@@ -140,78 +140,6 @@ class TrajectoryProfile:
         return TrajectorySample(theta, omega, alpha)
 
 
-@dataclass
-class SquareAccelProfile:
-    """Profil avec accélération carrée : +K puis -K."""
-
-    theta0: float
-    thetaf: float
-    duration: float
-    accel: float
-
-    def sample(self, t: float) -> TrajectorySample:
-        sign = 1.0 if self.thetaf >= self.theta0 else -1.0
-        accel = self.accel * sign
-        if t <= 0.0:
-            return TrajectorySample(self.theta0, 0.0, accel)
-        if t >= self.duration:
-            return TrajectorySample(self.thetaf, 0.0, -accel)
-
-        half = self.duration / 2.0
-        if t <= half:
-            omega = accel * t
-            theta = self.theta0 + 0.5 * accel * t ** 2
-            alpha = accel
-        else:
-            tau = t - half
-            omega_mid = accel * half
-            theta_mid = self.theta0 + 0.5 * accel * half ** 2
-            omega = omega_mid - accel * tau
-            theta = theta_mid + omega_mid * tau - 0.5 * accel * tau ** 2
-            alpha = -accel
-        return TrajectorySample(theta, omega, alpha)
-
-
-@dataclass
-class ManualProfile:
-    """Profil défini par l'utilisateur à partir d'accélérations ou de couples."""
-
-    theta0: float
-    duration: float
-    dt: float
-    mode: str
-    times: List[float]
-    theta_values: List[float]
-    omega_values: List[float]
-    alpha_values: List[float]
-    torque_values: List[float]
-
-    def sample(self, t: float) -> TrajectorySample:
-        if t <= 0.0:
-            return TrajectorySample(self.theta_values[0], self.omega_values[0], self.alpha_values[0])
-        if t >= self.duration:
-            return TrajectorySample(self.theta_values[-1], self.omega_values[-1], self.alpha_values[-1])
-
-        index = min(int(t // self.dt), len(self.alpha_values) - 1)
-        local_t = t - self.times[index]
-        theta0 = self.theta_values[index]
-        omega0 = self.omega_values[index]
-        alpha = self.alpha_values[index]
-        theta = theta0 + omega0 * local_t + 0.5 * alpha * local_t ** 2
-        omega = omega0 + alpha * local_t
-        return TrajectorySample(theta, omega, alpha)
-
-    def torque_at(self, t: float) -> float:
-        if self.mode != "torque":
-            return 0.0
-        if t <= 0.0:
-            return self.torque_values[0]
-        if t >= self.duration:
-            return self.torque_values[-1]
-        index = min(int(t // self.dt), len(self.torque_values) - 1)
-        return self.torque_values[index]
-
-
 class TrajectoryPlanner:
     """Planifie une trajectoire respectant les contraintes couple/vitesse."""
 
@@ -265,109 +193,38 @@ class TrajectoryPlanner:
 
     def plan(self) -> TrajectoryProfile:
         self.params.update_auto_limits()
-        profile, minimal_duration = self.plan_minimal_profile()
         mode = self.params.trajectory_mode
-        if minimal_duration == 0:
-            profile.duration = 0.0
-            profile.scale = 1.0
+        theta0 = math.radians(self.params.start_angle_deg)
+        thetaf = math.radians(self.params.target_angle_deg)
+        if mode == "fixed_duration":
+            duration = max(0.01, self.params.target_duration)
+            if abs(thetaf - theta0) < 1e-9:
+                return TrajectoryProfile(theta0, thetaf, 0.0, 0.0, 0.0, 0.0, 1.0)
+            distance = abs(thetaf - theta0)
+            accel_required = 4.0 * distance / (duration ** 2)
+            t_acc = duration / 2.0
+            profile = TrajectoryProfile(
+                theta0=theta0,
+                thetaf=thetaf,
+                t_acc=t_acc,
+                t_flat=0.0,
+                duration=duration,
+                a_nominal=accel_required,
+                scale=1.0,
+            )
             return profile
 
         if mode == "time_optimal":
+            profile, minimal_duration = self.plan_minimal_profile()
+            if minimal_duration == 0:
+                profile.duration = 0.0
+                profile.scale = 1.0
+                return profile
             profile.duration = minimal_duration
             profile.scale = 1.0
             return profile
 
-        if mode == "fixed_duration":
-            target = max(0.01, self.params.target_duration)
-            if target < minimal_duration - 1e-6:
-                self.params.target_duration = minimal_duration
-                raise TrajectoryError(
-                    "Durée demandée {:.2f}s trop courte. Minimum possible : {:.2f}s (valeur proposée).".format(
-                        target, minimal_duration
-                    )
-                )
-            scale = target / minimal_duration
-            profile.scale = scale
-            profile.duration = target
-            return profile
-
-        if mode == "square_accel":
-            target = max(0.01, self.params.target_duration)
-            theta0 = math.radians(self.params.start_angle_deg)
-            thetaf = math.radians(self.params.target_angle_deg)
-            delta = thetaf - theta0
-            if abs(delta) < 1e-9:
-                return SquareAccelProfile(theta0, thetaf, target, 0.0)
-            accel_needed = 4.0 * abs(delta) / (target ** 2)
-            accel_limit, _ = self.compute_limits()
-            if accel_needed > accel_limit + 1e-9:
-                raise TrajectoryError(
-                    "Accélération carrée requise {:.2f} rad/s² dépasse la limite {:.2f} rad/s²".format(
-                        accel_needed, accel_limit
-                    )
-                )
-            return SquareAccelProfile(theta0, thetaf, target, accel_needed)
-
-        if mode == "manual":
-            return self.build_manual_profile()
-
         raise TrajectoryError(f"Mode de trajectoire inconnu : {mode}")
-
-    def build_manual_profile(self) -> ManualProfile:
-        dt = max(1e-3, float(self.params.manual_profile_dt))
-        raw_values = [v.strip() for v in self.params.manual_profile_values.split(",") if v.strip()]
-        if not raw_values:
-            raise TrajectoryError("Aucune valeur saisie pour le profil manuel")
-        try:
-            values = [float(v) for v in raw_values]
-        except ValueError:
-            raise TrajectoryError("Valeurs du profil manuel invalides")
-
-        theta0 = math.radians(self.params.start_angle_deg)
-        model = ArmModel(self.params)
-        inertia = self.params.inertia()
-        theta = theta0
-        omega = 0.0
-        t = 0.0
-        times = [0.0]
-        theta_values = [theta0]
-        omega_values = [0.0]
-        alpha_values: List[float] = []
-        torque_values: List[float] = []
-
-        for value in values:
-            if self.params.manual_input_mode == "torque":
-                couple_moteur = clamp(value, -abs(self.params.max_torque), abs(self.params.max_torque))
-                couple_gravite = model.gravity_torque(theta)
-                alpha = (couple_moteur + couple_gravite) / inertia
-            else:
-                alpha = value
-                couple_moteur = inertia * alpha - model.gravity_torque(theta)
-                couple_moteur = clamp(couple_moteur, -abs(self.params.max_torque), abs(self.params.max_torque))
-            alpha_values.append(alpha)
-            torque_values.append(couple_moteur)
-            theta += omega * dt + 0.5 * alpha * dt * dt
-            omega += alpha * dt
-            t += dt
-            times.append(t)
-            theta_values.append(theta)
-            omega_values.append(omega)
-
-        duration = times[-1]
-        if duration <= 0.0:
-            raise TrajectoryError("Durée totale du profil manuel nulle")
-
-        return ManualProfile(
-            theta0=theta0,
-            duration=duration,
-            dt=dt,
-            mode=self.params.manual_input_mode,
-            times=times,
-            theta_values=theta_values,
-            omega_values=omega_values,
-            alpha_values=alpha_values,
-            torque_values=torque_values,
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -469,33 +326,20 @@ class ArmSimulation:
 
         # Avance de modèle + correcteur proportionnel dérivé simple
         inertia = self.params.inertia()
-        manual_torque = None
-        if isinstance(self.trajectory, ManualProfile) and self.trajectory.mode == "torque":
-            manual_torque = self.trajectory.torque_at(self.time)
-
         couple_gravite_state = self.model.gravity_torque(self.state.theta)
 
-        if manual_torque is None:
-            couple_commande, tau_g = self.model.required_torque(
-                alpha_ref, self.state.theta
-            )
-            if not self.params.gravity_compensation:
-                couple_commande += tau_g
-            couple_commande = clamp(
-                couple_commande,
-                -abs(self.params.max_torque),
-                abs(self.params.max_torque),
-            )
-            alpha = alpha_ref
-            couple_gravite = couple_gravite_state
-        else:
-            couple_commande = clamp(
-                manual_torque,
-                -abs(self.params.max_torque),
-                abs(self.params.max_torque),
-            )
-            couple_gravite = couple_gravite_state
-            alpha = (couple_commande + couple_gravite) / inertia
+        couple_commande, tau_g = self.model.required_torque(
+            alpha_ref, self.state.theta
+        )
+        if not self.params.gravity_compensation:
+            couple_commande += tau_g
+        couple_commande = clamp(
+            couple_commande,
+            -abs(self.params.max_torque),
+            abs(self.params.max_torque),
+        )
+        alpha = alpha_ref
+        couple_gravite = couple_gravite_state
 
         self.state.omega += alpha * dt
         self.state.omega = clamp(self.state.omega, -abs(self.params.max_velocity) * 1.5, abs(self.params.max_velocity) * 1.5)
@@ -750,9 +594,10 @@ class ParameterEditor:
             ("Masse bras (kg)", "mass_arm"),
             ("Masse charge (kg)", "mass_load"),
             ("Gravité (m/s²)", "gravity"),
+            ("Max couple (N·m)", "max_torque"),
+            ("Max accélération (rad/s²)", "max_acceleration"),
+            ("Max vitesse (rad/s)", "max_velocity"),
             ("Durée cible (s)", "target_duration"),
-            ("Profil manuel dt (s)", "manual_profile_dt"),
-            ("Profil manuel valeurs", "manual_profile_values"),
         ]
         self.labels = labels
         self.checkbox = Checkbox(
@@ -763,20 +608,13 @@ class ParameterEditor:
         )
         self.dropdown = Dropdown(
             pygame.Rect(self.area.x + 10, self.area.y + 10 + 2 * 24, 230, 28),
-            ["time_optimal", "fixed_duration", "square_accel", "manual"],
+            ["time_optimal", "fixed_duration"],
             self.params.trajectory_mode,
-            self.font,
-        )
-        self.manual_mode_dropdown = Dropdown(
-            pygame.Rect(self.area.x + 250, self.area.y + 10 + 2 * 24, 200, 28),
-            ["acceleration", "torque"],
-            self.params.manual_input_mode,
             self.font,
         )
         self.option_catalog = [
             ("Compensation gravité", "gravity_compensation"),
             ("Mode trajectoire", "trajectory_mode"),
-            ("Entrée manuelle", "manual_input_mode"),
         ]
         y = self.area.y + 10 + 3 * 28
         for label, key in labels:
@@ -790,24 +628,19 @@ class ParameterEditor:
     def update_from_params(self):
         self.checkbox.value = self.params.gravity_compensation
         self.dropdown.value = self.params.trajectory_mode
-        self.manual_mode_dropdown.value = self.params.manual_input_mode
         for key, widget in self.widgets.items():
             if isinstance(widget, TextInput):
                 widget.text = f"{getattr(self.params, key)}"
 
     def has_open_dropdown(self) -> bool:
-        return self.dropdown.open or self.manual_mode_dropdown.open
+        return self.dropdown.open
 
     def handle_event(self, event: pygame.event.Event) -> bool:
         if self.has_open_dropdown():
             if self.dropdown.open:
                 self.dropdown.handle_event(event)
-            if self.manual_mode_dropdown.open:
-                self.manual_mode_dropdown.handle_event(event)
             return True
         if self.dropdown.handle_event(event):
-            return True
-        if self.manual_mode_dropdown.handle_event(event):
             return True
         self.checkbox.handle_event(event)
         for widget in self.widgets.values():
@@ -830,7 +663,6 @@ class ParameterEditor:
                         setattr(self.params, key, value)
             self.params.gravity_compensation = self.checkbox.value
             self.params.trajectory_mode = self.dropdown.value
-            self.params.manual_input_mode = self.manual_mode_dropdown.value
             self.error_message = ""
             self.success_message = "Paramètres mis à jour"
             self.highlight_key = None
@@ -858,17 +690,22 @@ class ParameterEditor:
                 widget.active = True
         elif key == "trajectory_mode":
             self.dropdown.open = True
-        elif key == "manual_input_mode":
-            self.manual_mode_dropdown.open = True
 
     def clear_highlight(self):
         self.highlight_key = None
         self.dropdown.open = False
-        self.manual_mode_dropdown.open = False
 
     def draw_overlays(self, surface: pygame.Surface):
         self.dropdown.draw_overlay(surface)
-        self.manual_mode_dropdown.draw_overlay(surface)
+
+    def set_feedback(self, lines: Sequence[str], success: bool = True):
+        text = "\n".join(lines)
+        if success:
+            self.success_message = text
+            self.error_message = ""
+        else:
+            self.error_message = text
+            self.success_message = ""
 
     def draw(self, surface: pygame.Surface):
         if self.highlight_key and time.time() - self.highlight_time > 4.0:
@@ -882,17 +719,6 @@ class ParameterEditor:
         if self.highlight_key == "trajectory_mode":
             pygame.draw.rect(surface, HIGHLIGHT_COLOR, self.dropdown.rect.inflate(8, 8), width=2, border_radius=6)
         self.dropdown.draw(surface)
-        label_manual_mode = self.font.render("Entrée manuelle", True, TEXT_COLOR)
-        surface.blit(label_manual_mode, (self.manual_mode_dropdown.rect.x, self.manual_mode_dropdown.rect.y - 20))
-        if self.highlight_key == "manual_input_mode":
-            pygame.draw.rect(
-                surface,
-                HIGHLIGHT_COLOR,
-                self.manual_mode_dropdown.rect.inflate(8, 8),
-                width=2,
-                border_radius=6,
-            )
-        self.manual_mode_dropdown.draw(surface)
         y = self.dropdown.rect.bottom + 10
         for label, key in self.labels:
             label_surface = self.font.render(label, True, TEXT_COLOR)
@@ -903,19 +729,22 @@ class ParameterEditor:
                 pygame.draw.rect(surface, HIGHLIGHT_COLOR, widget.rect.inflate(8, 8), width=2, border_radius=6)
             widget.draw(surface)
             y = widget.rect.bottom + 6
-        auto_text = self.font.render(
-            "Limites de couple/vitesse/accélération calculées automatiquement.",
-            True,
-            TEXT_COLOR,
+        note = (
+            "En mode durée fixe, les limites sont estimées automatiquement."
+            if self.params.trajectory_mode == "fixed_duration"
+            else "En mode optimal, indiquez vos limites manuelles."
         )
+        auto_text = self.font.render(note, True, TEXT_COLOR)
         surface.blit(auto_text, (self.area.x + 12, y + 6))
         y += auto_text.get_height() + 10
         if self.error_message:
-            err = self.font.render(self.error_message, True, ERROR_COLOR)
-            surface.blit(err, (self.area.x + 10, self.area.bottom - 60))
+            for i, line in enumerate(self.error_message.splitlines()):
+                err = self.font.render(line, True, ERROR_COLOR)
+                surface.blit(err, (self.area.x + 10, self.area.bottom - 60 + i * 18))
         elif self.success_message:
-            msg = self.font.render(self.success_message, True, SUCCESS_COLOR)
-            surface.blit(msg, (self.area.x + 10, self.area.bottom - 60))
+            for i, line in enumerate(self.success_message.splitlines()):
+                msg = self.font.render(line, True, SUCCESS_COLOR)
+                surface.blit(msg, (self.area.x + 10, self.area.bottom - 60 + i * 18))
 
 
 @dataclass
@@ -948,10 +777,10 @@ class TableGeneratorPanel:
             ("Masse bras (kg)", "mass_arm"),
             ("Masse charge (kg)", "mass_load"),
             ("Gravité (m/s²)", "gravity"),
-            ("Durée cible (s)", "target_duration"),
-            ("Max vitesse (rad/s)", "max_velocity"),
-            ("Max accélération (rad/s²)", "max_acceleration"),
             ("Max couple (N·m)", "max_torque"),
+            ("Max accélération (rad/s²)", "max_acceleration"),
+            ("Max vitesse (rad/s)", "max_velocity"),
+            ("Durée cible (s)", "target_duration"),
         ]
         self.param_map = {label: key for label, key in self.param_options}
         dropdown_rect = pygame.Rect(self.area.x + 12, self.area.y + 48, 300, 32)
@@ -1404,8 +1233,6 @@ class Application:
         self.message = ""
         self.message_time = 0.0
         self.toolbar_buttons: List[Button] = []
-        self.toolbar_dropdowns: List[Dropdown] = []
-        self.modifier_dropdown: Optional[Dropdown] = None
         self.sim_panel_width = int(self.window_width * 0.48)
         self.plot_panel_width = self.window_width - self.sim_panel_width
         self.plot_panel = PlotPanel(
@@ -1469,20 +1296,7 @@ class Application:
 
     def create_toolbar(self):
         self.toolbar_buttons.clear()
-        self.toolbar_dropdowns = []
-        dropdown_width = 260
-        dropdown_height = 32
-        dropdown_rect = pygame.Rect(10, (TOOLBAR_HEIGHT - dropdown_height) // 2, dropdown_width, dropdown_height)
-        options = ["Modifier..."] + self.editor.option_labels()
-        self.modifier_dropdown = Dropdown(
-            dropdown_rect,
-            options,
-            "Modifier...",
-            self.small_font,
-            on_change=self.on_modifier_option_selected,
-        )
-        self.toolbar_dropdowns.append(self.modifier_dropdown)
-        x = dropdown_rect.right + 12
+        x = 10
         labels = [
             ("Modifier", self.toggle_mode),
             ("Tableau", self.toggle_table_mode),
@@ -1497,21 +1311,9 @@ class Application:
             ("Charger cfg", self.on_reload_config),
         ]
         for label, callback in labels:
-            rect = pygame.Rect(x, 10, 130, 40)
+            rect = pygame.Rect(x, (TOOLBAR_HEIGHT - 40) // 2, 130, 40)
             self.toolbar_buttons.append(Button(rect, label, callback, self.small_font))
             x += rect.width + 8
-
-    def on_modifier_option_selected(self, option: str):
-        if option == "Modifier...":
-            return
-        if self.mode != "edit":
-            self.toggle_mode()
-        if self.mode == "edit":
-            self.editor.focus_option_by_label(option)
-            self.set_message(f"Sélection : {option}", success=True)
-        if self.modifier_dropdown:
-            self.modifier_dropdown.value = "Modifier..."
-            self.modifier_dropdown.open = False
 
     def toggle_mode(self):
         if self.mode == "table":
@@ -1906,9 +1708,52 @@ class Application:
     # ------------------------------------------------------------------
 
     def recompute_trajectory(self, initial: bool = False, start_after: bool = True):
-        self.params.update_auto_limits()
         profile = self.planner.plan()
         self.simulation.set_trajectory(profile)
+
+        feedback_lines: List[str] = []
+        if isinstance(profile, TrajectoryProfile) and profile.duration > 0.0:
+            scale = profile.scale if hasattr(profile, "scale") else 1.0
+            accel_mag = profile.a_nominal / (scale ** 2) if scale != 0 else 0.0
+            t_acc = profile.t_acc * scale
+            t_flat = profile.t_flat * scale
+            omega_peak = profile.a_nominal * profile.t_acc / scale if scale != 0 else 0.0
+            if self.params.trajectory_mode == "fixed_duration":
+                model = ArmModel(self.params)
+                max_torque = 0.0
+                samples = max(20, int(profile.duration * 200))
+                for i in range(samples + 1):
+                    t = profile.duration * i / samples
+                    sample = profile.sample(t)
+                    torque, _ = model.required_torque(sample.alpha, sample.theta)
+                    max_torque = max(max_torque, abs(torque))
+                self.params.max_acceleration = accel_mag
+                self.params.max_velocity = abs(omega_peak)
+                self.params.max_torque = max_torque
+                feedback_lines.append(
+                    f"Accélération + : {accel_mag:.3f} rad/s² pendant {t_acc:.3f} s"
+                )
+                feedback_lines.append(
+                    f"Accélération - : {-accel_mag:.3f} rad/s² pendant {t_acc:.3f} s"
+                )
+                if t_flat > 1e-6:
+                    feedback_lines.append(
+                        f"Phase à vitesse constante : {t_flat:.3f} s"
+                    )
+                feedback_lines.append(f"Vitesse max atteinte : {omega_peak:.3f} rad/s")
+                feedback_lines.append(f"Couple max requis : {max_torque:.3f} N·m")
+            else:
+                feedback_lines.append(f"Durée minimale : {profile.duration:.3f} s")
+                feedback_lines.append(f"Accélération limite : {accel_mag:.3f} rad/s²")
+                feedback_lines.append(f"Vitesse max : {omega_peak:.3f} rad/s")
+
+        self.editor.update_from_params()
+        self.table_panel.sync_params(self.params)
+        if feedback_lines:
+            self.editor.set_feedback(feedback_lines, success=True)
+        else:
+            self.editor.set_feedback(["Trajectoire calculée"], success=True)
+
         if not initial and start_after:
             self.simulation.start()
 
@@ -1927,17 +1772,6 @@ class Application:
                     self.on_reset()
                 elif event.key == pygame.K_p:
                     self.on_pause()
-            toolbar_modal = any(dropdown.open for dropdown in self.toolbar_dropdowns)
-            if toolbar_modal:
-                for dropdown in self.toolbar_dropdowns:
-                    dropdown.handle_event(event)
-                continue
-            dropdown_consumed = False
-            for dropdown in self.toolbar_dropdowns:
-                if dropdown.handle_event(event):
-                    dropdown_consumed = True
-            if dropdown_consumed:
-                continue
             for button in self.toolbar_buttons:
                 button.handle_event(event)
             if self.mode == "edit":
@@ -1958,8 +1792,6 @@ class Application:
         pygame.draw.rect(self.screen, TOOLBAR_BG, pygame.Rect(0, 0, self.window_width, TOOLBAR_HEIGHT))
         for button in self.toolbar_buttons:
             button.draw(self.screen)
-        for dropdown in self.toolbar_dropdowns:
-            dropdown.draw(self.screen)
         if self.message:
             if time.time() - self.message_time > 4.0:
                 self.message = ""
@@ -1968,8 +1800,6 @@ class Application:
                 self.screen.blit(text, (self.window_width - text.get_width() - 20, 20))
 
     def draw_dropdown_modals(self):
-        for dropdown in self.toolbar_dropdowns:
-            dropdown.draw_overlay(self.screen)
         if self.mode == "edit":
             self.editor.draw_overlays(self.screen)
         elif self.mode == "table":
