@@ -1195,37 +1195,40 @@ class PlotPanel:
 
     def draw(self, surface: pygame.Surface):
         pygame.draw.rect(surface, PANEL_BG, self.area)
-        legend_rows = 2
-        checkbox_height = 16
-        row_spacing = 8
-        legend_height = legend_rows * (checkbox_height + row_spacing) - row_spacing
-        legend_area = pygame.Rect(
-            self.area.x + 10,
-            self.area.y + 10,
-            self.area.width - 20,
-            legend_height,
-        )
-        # Draw checkboxes
-        items_per_row = math.ceil(len(self.signals) / legend_rows)
-        row_x = [legend_area.x for _ in range(legend_rows)]
+        checkbox_height = 18
+        spacing_x = 18
+        spacing_y = 10
+        legend_left = self.area.x + 10
+        legend_top = self.area.y + 10
+        legend_right = self.area.right - 10
+        current_x = legend_left
+        current_y = legend_top
+        max_bottom = current_y
         self.checkbox_rects.clear()
-        for index, name in enumerate(self.signals):
-            row = min(index // items_per_row, legend_rows - 1)
-            col_y = legend_area.y + row * (checkbox_height + row_spacing)
-            checkbox = pygame.Rect(row_x[row], col_y, checkbox_height, checkbox_height)
+        for name in self.signals:
+            label = self.font.render(name, True, TEXT_COLOR)
+            item_width = checkbox_height + 4 + label.get_width()
+            if current_x != legend_left and current_x + item_width > legend_right:
+                current_x = legend_left
+                current_y = max_bottom + spacing_y
+            checkbox = pygame.Rect(current_x, current_y, checkbox_height, checkbox_height)
             pygame.draw.rect(surface, TRACE_COLORS[name], checkbox, width=2)
             if self.selected[name]:
                 pygame.draw.rect(surface, TRACE_COLORS[name], checkbox.inflate(-4, -4))
-            label = self.font.render(name, True, TEXT_COLOR)
             surface.blit(label, (checkbox.right + 4, checkbox.y - 2))
-            row_x[row] = checkbox.right + label.get_width() + 20
             self.checkbox_rects[name] = checkbox
+            current_x = checkbox.right + 4 + label.get_width() + spacing_x
+            max_bottom = max(max_bottom, checkbox.bottom)
 
+        legend_height = max(0, max_bottom - legend_top)
+
+        plot_top = legend_top + legend_height + 12
+        plot_height = max(0, self.area.height - (plot_top - self.area.y) - 30)
         plot_rect = pygame.Rect(
             self.area.x + 10,
-            legend_area.bottom + 10,
+            plot_top,
             self.area.width - 20,
-            self.area.height - legend_area.height - 40,
+            plot_height,
         )
         self.plot_rect = plot_rect
         pygame.draw.rect(surface, (20, 20, 28), plot_rect)
@@ -1519,16 +1522,9 @@ class Application:
             ("Modifier", self.toggle_mode),
             ("Tableau", self.toggle_table_mode),
             ("Lancer", self.on_launch),
-            ("Réinitialiser", self.on_reset),
-            ("Exporter", self.on_export),
             ("Courbe fichier", self.on_save_active_plot),
             ("Courbes base", self.on_send_plots_to_database),
-            ("Pause", self.on_pause),
-            ("Courbes freeze", self.on_freeze_plots),
-            ("Courbes reset", self.on_reset_plots),
             ("Curseur", self.on_toggle_cursor),
-            ("Sauver cfg", self.save_params),
-            ("Charger cfg", self.on_reload_config),
         ]
         for label, callback in labels:
             rect = pygame.Rect(x, (TOOLBAR_HEIGHT - 40) // 2, 130, 40)
@@ -2019,6 +2015,14 @@ class Application:
         self.simulation.toggle_pause()
         self.set_message("Pause" if self.simulation.paused else "Lecture", success=True)
 
+    def handle_space_key(self):
+        if self.mode != "run":
+            return
+        if not self.simulation.running or self.simulation.progress >= 0.999:
+            self.on_launch()
+        else:
+            self.on_pause()
+
     def on_freeze_plots(self):
         self.plot_panel.toggle_freeze()
         self.simulation.freeze_logs = self.plot_panel.freeze
@@ -2115,7 +2119,7 @@ class Application:
                 if event.key == pygame.K_ESCAPE:
                     return False
                 if event.key == pygame.K_SPACE:
-                    self.on_launch()
+                    self.handle_space_key()
                 elif event.key == pygame.K_r:
                     self.on_reset()
                 elif event.key == pygame.K_p:
