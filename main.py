@@ -628,6 +628,7 @@ class ParameterEditor:
             ["time_optimal", "fixed_duration"],
             self.params.trajectory_mode,
             self.font,
+            on_change=self._on_mode_change,
         )
         self.option_catalog = [
             ("Compensation gravité", "gravity_compensation"),
@@ -648,6 +649,29 @@ class ParameterEditor:
         for key, widget in self.widgets.items():
             if isinstance(widget, TextInput):
                 widget.text = f"{getattr(self.params, key)}"
+
+    def _on_mode_change(self, new_mode: str):
+        previous_mode = self.params.trajectory_mode
+        if new_mode == previous_mode:
+            return
+
+        if previous_mode == "time_optimal":
+            self.params.store_manual_limits()
+
+        self.params.trajectory_mode = new_mode
+
+        if new_mode == "time_optimal":
+            self.params.apply_manual_limits()
+        else:
+            self.params.update_auto_limits()
+
+        for widget in self.widgets.values():
+            if isinstance(widget, TextInput):
+                widget.active = False
+
+        self.update_from_params()
+        self.error_message = ""
+        self.success_message = f"Mode trajectoire : {new_mode}"
 
     def visible_keys(self) -> Set[str]:
         keys = set(self.common_keys)
@@ -688,6 +712,8 @@ class ParameterEditor:
                         setattr(self.params, key, value)
             self.params.gravity_compensation = self.checkbox.value
             self.params.trajectory_mode = self.dropdown.value
+            if self.params.trajectory_mode == "time_optimal":
+                self.params.store_manual_limits()
             self.error_message = ""
             self.success_message = "Paramètres mis à jour"
             self.highlight_key = None
@@ -1324,10 +1350,14 @@ class Application:
             try:
                 with open(CONFIG_PATH, "r", encoding="utf-8") as fp:
                     data = json.load(fp)
-                return ArmParameters.from_dict(data)
+                params = ArmParameters.from_dict(data)
+                params.ensure_mode_consistency()
+                return params
             except (OSError, json.JSONDecodeError) as exc:
                 print(f"Impossible de charger {CONFIG_PATH}: {exc}")
-        return ArmParameters()
+        params = ArmParameters()
+        params.ensure_mode_consistency()
+        return params
 
     def save_params(self):
         try:

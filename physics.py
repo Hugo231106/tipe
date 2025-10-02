@@ -28,6 +28,9 @@ class ArmParameters:
     trajectory_mode: str = "fixed_duration"  # ou "time_optimal"
     target_duration: float = 3.0
     auto_limits: bool = True
+    manual_max_torque: float = 18.0
+    manual_max_velocity: float = 6.0
+    manual_max_acceleration: float = 20.0
 
     def inertia(self) -> float:
         i_arm = (1.0 / 3.0) * self.mass_arm * self.length ** 2
@@ -59,6 +62,28 @@ class ArmParameters:
         inertia = self.inertia()
         torque_required = inertia * self.max_acceleration + abs(self.gravity_term())
         self.max_torque = max(1.0, torque_required)
+
+    def store_manual_limits(self):
+        """Sauvegarde les limites manuelles pour un futur retour en mode optimal."""
+
+        self.manual_max_torque = self.max_torque
+        self.manual_max_velocity = self.max_velocity
+        self.manual_max_acceleration = self.max_acceleration
+
+    def apply_manual_limits(self):
+        """Restaure les limites manuelles stockées."""
+
+        self.max_torque = self.manual_max_torque
+        self.max_velocity = self.manual_max_velocity
+        self.max_acceleration = self.manual_max_acceleration
+
+    def ensure_mode_consistency(self):
+        """Garantit la cohérence des limites selon le mode courant."""
+
+        if self.trajectory_mode == "time_optimal":
+            self.apply_manual_limits()
+        else:
+            self.update_auto_limits()
 
     def to_dict(self) -> Dict[str, object]:
         data = asdict(self)
