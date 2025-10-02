@@ -25,11 +25,8 @@ class ArmParameters:
     max_velocity: float = 6.0
     max_acceleration: float = 20.0
     gravity_compensation: bool = True
-    trajectory_mode: str = "fixed_duration"  # ou "time_optimal", "square_accel", "manual"
+    trajectory_mode: str = "fixed_duration"  # ou "time_optimal"
     target_duration: float = 3.0
-    manual_input_mode: str = "acceleration"  # ou "torque"
-    manual_profile_dt: float = 0.1
-    manual_profile_values: str = "5, -5"
     auto_limits: bool = True
 
     def inertia(self) -> float:
@@ -46,17 +43,22 @@ class ArmParameters:
     def update_auto_limits(self):
         if not self.auto_limits:
             return
+        if self.trajectory_mode == "time_optimal":
+            return
         duration = max(0.1, float(self.target_duration))
         theta0 = math.radians(self.start_angle_deg)
         thetaf = math.radians(self.target_angle_deg)
         delta = abs(thetaf - theta0)
         if delta < 1e-4:
             delta = 1e-4
-        self.max_velocity = max(0.1, 2.0 * delta / duration)
-        self.max_acceleration = max(0.1, 4.0 * delta / (duration ** 2))
+        # Profil triangulaire : accélération positive pendant T/2 puis négative.
+        accel_required = max(0.1, 4.0 * delta / (duration ** 2))
+        velocity_peak = accel_required * duration / 2.0
+        self.max_velocity = velocity_peak
+        self.max_acceleration = accel_required
         inertia = self.inertia()
         torque_required = inertia * self.max_acceleration + abs(self.gravity_term())
-        self.max_torque = max(1.0, torque_required * 1.1)
+        self.max_torque = max(1.0, torque_required)
 
     def to_dict(self) -> Dict[str, object]:
         data = asdict(self)
