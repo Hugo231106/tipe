@@ -46,6 +46,7 @@ FONT_NAME = "freesansbold.ttf"
 CONFIG_PATH = "config.json"
 EXPORT_PATH = "export.csv"
 TABLE_EXPORT_DIR = "tables"
+PLOT_EXPORT_DIR = "plot_exports"
 
 BACKGROUND_COLOR = (15, 18, 26)
 PANEL_BG = (28, 31, 40)
@@ -582,6 +583,22 @@ class ParameterEditor:
         self.option_map: Dict[str, str] = {}
         self.highlight_key: Optional[str] = None
         self.highlight_time = 0.0
+        self.common_keys: Set[str] = {
+            "start_angle_deg",
+            "target_angle_deg",
+            "length",
+            "mass_arm",
+            "mass_load",
+            "gravity",
+        }
+        self.mode_specific_keys: Dict[str, Set[str]] = {
+            "fixed_duration": {"target_duration"},
+            "time_optimal": {
+                "max_torque",
+                "max_acceleration",
+                "max_velocity",
+            },
+        }
         self._build_widgets()
 
     def _build_widgets(self):
@@ -632,6 +649,11 @@ class ParameterEditor:
             if isinstance(widget, TextInput):
                 widget.text = f"{getattr(self.params, key)}"
 
+    def visible_keys(self) -> Set[str]:
+        keys = set(self.common_keys)
+        keys.update(self.mode_specific_keys.get(self.params.trajectory_mode, set()))
+        return keys
+
     def has_open_dropdown(self) -> bool:
         return self.dropdown.open
 
@@ -649,7 +671,10 @@ class ParameterEditor:
 
     def apply_changes(self) -> bool:
         try:
+            visible = self.visible_keys()
             for key, widget in self.widgets.items():
+                if key not in visible:
+                    continue
                 if isinstance(widget, TextInput):
                     value = widget.text.strip().replace(",", ".")
                     if value == "":
@@ -673,11 +698,15 @@ class ParameterEditor:
             return False
 
     def option_labels(self) -> List[str]:
-        return [label for label, _ in self.option_catalog]
+        visible = self.visible_keys()
+        visible.update({"gravity_compensation", "trajectory_mode"})
+        return [label for label, key in self.option_catalog if key in visible]
 
     def focus_option_by_label(self, label: str):
         key = self.option_map.get(label)
         if not key:
+            return
+        if key not in {"gravity_compensation", "trajectory_mode"} and key not in self.visible_keys():
             return
         self.highlight_key = key
         self.highlight_time = time.time()
@@ -711,6 +740,7 @@ class ParameterEditor:
         if self.highlight_key and time.time() - self.highlight_time > 4.0:
             self.clear_highlight()
         pygame.draw.rect(surface, PANEL_BG, self.area)
+        visible_keys = self.visible_keys()
         if self.highlight_key == "gravity_compensation":
             pygame.draw.rect(surface, HIGHLIGHT_COLOR, self.checkbox.rect.inflate(8, 8), width=2, border_radius=6)
         self.checkbox.draw(surface)
@@ -721,6 +751,8 @@ class ParameterEditor:
         self.dropdown.draw(surface)
         y = self.dropdown.rect.bottom + 10
         for label, key in self.labels:
+            if key not in visible_keys:
+                continue
             label_surface = self.font.render(label, True, TEXT_COLOR)
             surface.blit(label_surface, (self.area.x + 12, y))
             widget = self.widgets[key]
@@ -737,6 +769,24 @@ class ParameterEditor:
         auto_text = self.font.render(note, True, TEXT_COLOR)
         surface.blit(auto_text, (self.area.x + 12, y + 6))
         y += auto_text.get_height() + 10
+        visible_labels = [label for label, key in self.labels if key in visible_keys]
+        hidden_labels = [label for label, key in self.labels if key not in visible_keys]
+        if visible_labels:
+            title = self.font.render("Champs affichés :", True, TEXT_COLOR)
+            surface.blit(title, (self.area.x + 12, y))
+            y += title.get_height() + 4
+            for item in visible_labels:
+                bullet = self.font.render(f"• {item}", True, TEXT_COLOR)
+                surface.blit(bullet, (self.area.x + 18, y))
+                y += bullet.get_height() + 2
+        if hidden_labels:
+            hidden_title = self.font.render("Champs masqués :", True, (170, 170, 180))
+            surface.blit(hidden_title, (self.area.x + 12, y))
+            y += hidden_title.get_height() + 4
+            for item in hidden_labels:
+                bullet = self.font.render(f"• {item}", True, (150, 150, 160))
+                surface.blit(bullet, (self.area.x + 18, y))
+                y += bullet.get_height() + 2
         if self.error_message:
             for i, line in enumerate(self.error_message.splitlines()):
                 err = self.font.render(line, True, ERROR_COLOR)
@@ -956,19 +1006,8 @@ class PlotPanel:
         self.selected: Dict[str, bool] = {
             name: name
             in (
-                "angle",
-                "omega",
                 "alpha",
                 "couple_moteur",
-                "couple_gravite",
-                "couple_total",
-                "power",
-                "x",
-                "y",
-                "vx",
-                "vy",
-                "ax",
-                "ay",
             )
             for name in self.signals
         }
@@ -1017,6 +1056,13 @@ class PlotPanel:
             self.cached_data["x"].append(entry.x)
             self.cached_data["y"].append(entry.y)
             self.cached_data["z"].append(entry.z)
+
+    def active_signal_names(self) -> List[str]:
+        return [
+            name
+            for name in self.signals
+            if self.selected.get(name, False) and self.cached_data.get(name)
+        ]
 
     def handle_event(self, event: pygame.event.Event):
         if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
@@ -1076,7 +1122,7 @@ class PlotPanel:
         if t1 - t0 < 1e-6:
             return
 
-        active_signals = [name for name in self.signals if self.selected.get(name, False) and self.cached_data[name]]
+        active_signals = self.active_signal_names()
         if not active_signals:
             return
 
@@ -1102,12 +1148,9 @@ class PlotPanel:
         pygame.draw.line(surface, (120, 120, 140), (plot_rect.x, plot_rect.bottom), (plot_rect.x, plot_rect.y), width=1)
 
         legend_index = 0
-        for name, values in self.cached_data.items():
-            if not self.selected.get(name, False):
-                continue
+        for name in active_signals:
+            values = self.cached_data[name]
             color = TRACE_COLORS.get(name, (200, 200, 200))
-            if not values:
-                continue
             min_v = min(values)
             max_v = max(values)
             points = []
@@ -1233,6 +1276,7 @@ class Application:
         self.message = ""
         self.message_time = 0.0
         self.toolbar_buttons: List[Button] = []
+        self.pending_plot_snapshot: Optional[Dict[str, object]] = None
         self.sim_panel_width = int(self.window_width * 0.48)
         self.plot_panel_width = self.window_width - self.sim_panel_width
         self.plot_panel = PlotPanel(
@@ -1244,6 +1288,7 @@ class Application:
             ),
             self.small_font,
         )
+        os.makedirs(PLOT_EXPORT_DIR, exist_ok=True)
         self.sim_renderer = SimulationRenderer(
             pygame.Rect(
                 0,
@@ -1303,6 +1348,8 @@ class Application:
             ("Lancer", self.on_launch),
             ("Réinitialiser", self.on_reset),
             ("Exporter", self.on_export),
+            ("Courbe fichier", self.on_save_active_plot),
+            ("Courbes base", self.on_send_plots_to_database),
             ("Pause", self.on_pause),
             ("Courbes freeze", self.on_freeze_plots),
             ("Courbes reset", self.on_reset_plots),
@@ -1406,6 +1453,76 @@ class Application:
             self.set_message(f"Exporté vers {EXPORT_PATH}", success=True)
         except OSError as exc:
             self.set_message(f"Erreur export : {exc}", success=False)
+
+    def on_save_active_plot(self):
+        if self.mode != "run":
+            self.set_message("Passez en mode simulation pour exporter la courbe", success=False)
+            return
+        if len(self.plot_panel.time_data) < 2:
+            self.set_message("Aucune donnée de courbe disponible", success=False)
+            return
+        signals = self.plot_panel.active_signal_names()
+        if not signals:
+            self.set_message("Aucune courbe sélectionnée", success=False)
+            return
+        timestamp = time.strftime("%Y%m%d-%H%M%S")
+        self.pending_plot_snapshot = {
+            "timestamp": timestamp,
+            "signals": signals,
+            "prefix": "selection",
+        }
+        self.set_message("Export graphique en préparation...", success=True)
+
+    def on_send_plots_to_database(self):
+        if len(self.plot_panel.time_data) < 2:
+            self.set_message("Aucune donnée de courbe disponible", success=False)
+            return
+        signals = [
+            name for name in self.plot_panel.signals if self.plot_panel.cached_data.get(name)
+        ]
+        if not signals:
+            self.set_message("Aucune courbe à enregistrer", success=False)
+            return
+        timestamp = time.strftime("%Y%m%d-%H%M%S")
+        row_count = min(
+            len(self.plot_panel.time_data),
+            *(len(self.plot_panel.cached_data[name]) for name in signals),
+        )
+        if row_count == 0:
+            self.set_message("Aucune donnée exploitable", success=False)
+            return
+        record = {
+            "timestamp": timestamp,
+            "mode": self.params.trajectory_mode,
+            "time": [float(self.plot_panel.time_data[i]) for i in range(row_count)],
+            "signals": {
+                name: [
+                    float(self.plot_panel.cached_data[name][i]) for i in range(row_count)
+                ]
+                for name in signals
+            },
+        }
+        path = os.path.join(PLOT_EXPORT_DIR, "database.json")
+        try:
+            data: List[Dict[str, object]]
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as fp:
+                    try:
+                        existing = json.load(fp)
+                        if isinstance(existing, list):
+                            data = existing
+                        else:
+                            data = []
+                    except json.JSONDecodeError:
+                        data = []
+            else:
+                data = []
+            data.append(record)
+            with open(path, "w", encoding="utf-8") as fp:
+                json.dump(data, fp, indent=2)
+            self.set_message("Graphiques enregistrés dans la base", success=True)
+        except OSError as exc:
+            self.set_message(f"Erreur base graphique : {exc}", success=False)
 
     def on_generate_table(self, request: TableRequest) -> Tuple[bool, str, List[str], List[Dict[str, object]]]:
         preview_rows: List[Dict[str, object]] = []
@@ -1558,6 +1675,61 @@ class Application:
                 sheets.append((sheet_name, formatted_rows))
             self._write_xlsx(path, sheets)
         return path
+
+    def _create_plot_export_folder(self, prefix: str, timestamp: str) -> str:
+        base = os.path.join(PLOT_EXPORT_DIR, f"{prefix}_{timestamp}")
+        path = base
+        counter = 1
+        while os.path.exists(path):
+            path = f"{base}_{counter}"
+            counter += 1
+        os.makedirs(path, exist_ok=False)
+        return path
+
+    def _write_plot_csv(self, folder: str, signals: Sequence[str]):
+        csv_path = os.path.join(folder, "data.csv")
+        times = self.plot_panel.time_data
+        if not times:
+            raise ValueError("Aucune donnée temps disponible")
+        row_count = min(
+            len(times),
+            *(len(self.plot_panel.cached_data[name]) for name in signals),
+        )
+        if row_count == 0:
+            raise ValueError("Aucune donnée de courbe à écrire")
+        with open(csv_path, "w", newline="", encoding="utf-8") as fp:
+            writer = csv.writer(fp)
+            writer.writerow(["time", *signals])
+            for index in range(row_count):
+                row: List[str] = [f"{times[index]:.6f}"]
+                for name in signals:
+                    value = self.plot_panel.cached_data[name][index]
+                    row.append(f"{value:.6f}")
+                writer.writerow(row)
+
+    def _capture_plot_image(self, folder: str):
+        surface = pygame.display.get_surface()
+        if surface is None:
+            raise RuntimeError("Aucune surface d'affichage disponible")
+        try:
+            snapshot = surface.subsurface(self.plot_panel.area).copy()
+        except ValueError as exc:
+            raise RuntimeError(f"Capture impossible : {exc}") from exc
+        image_path = os.path.join(folder, "plot.png")
+        pygame.image.save(snapshot, image_path)
+
+    def process_plot_snapshot(self):
+        if not self.pending_plot_snapshot:
+            return
+        task = self.pending_plot_snapshot
+        self.pending_plot_snapshot = None
+        try:
+            folder = self._create_plot_export_folder(task["prefix"], task["timestamp"])
+            self._write_plot_csv(folder, task["signals"])
+            self._capture_plot_image(folder)
+            self.set_message(f"Graphique exporté vers {folder}", success=True)
+        except (OSError, ValueError, RuntimeError) as exc:
+            self.set_message(f"Erreur export graphique : {exc}", success=False)
 
     def _sanitize_sheet_name(self, name: str, existing: Set[str]) -> str:
         invalid = "[]:*?/\\"
@@ -1824,6 +1996,7 @@ class Application:
             self.plot_panel.draw(self.screen)
         self.draw_dropdown_modals()
         pygame.display.flip()
+        self.process_plot_snapshot()
 
     def run(self):
         running = True
