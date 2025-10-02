@@ -643,6 +643,34 @@ class ParameterEditor:
             y += line_height + padding
         self.option_map = {label: key for label, key in self.option_catalog}
 
+    def resize(self, area: pygame.Rect):
+        self.area = area
+        checkbox_size = 24
+        self.checkbox.rect = pygame.Rect(
+            area.x + 10,
+            area.y + 10,
+            checkbox_size,
+            checkbox_size,
+        )
+        dropdown_height = self.dropdown.rect.height
+        dropdown_width = max(160, area.width - 20)
+        self.dropdown.rect = pygame.Rect(
+            area.x + 10,
+            area.y + 10 + 2 * checkbox_size,
+            dropdown_width,
+            dropdown_height,
+        )
+        padding = 6
+        line_height = 32
+        y = area.y + 10 + 3 * dropdown_height
+        input_width = max(160, area.width - 20)
+        for label, key in self.labels:
+            rect = pygame.Rect(area.x + 10, y, input_width, line_height)
+            widget = self.widgets.get(key)
+            if isinstance(widget, Widget):
+                widget.rect = rect
+            y += line_height + padding
+
     def update_from_params(self):
         self.checkbox.value = self.params.gravity_compensation
         self.dropdown.value = self.params.trajectory_mode
@@ -888,6 +916,69 @@ class TableGeneratorPanel:
     def clear_status(self):
         self.status_message = ""
         self.preview_lines = []
+
+    def resize(self, area: pygame.Rect):
+        self.area = area
+        dropdown_height = self.param_dropdown.rect.height
+        dropdown_width = max(220, min(area.width - 24, 400))
+        dropdown_rect = pygame.Rect(
+            area.x + 12,
+            area.y + 48,
+            dropdown_width,
+            dropdown_height,
+        )
+        self.param_dropdown.rect = dropdown_rect
+
+        margin = 12
+        spacing = 16
+        input_height = self.first_input.rect.height
+        available_width = max(240, area.width - 2 * margin - spacing)
+        input_width = max(160, min(available_width // 2, area.width - 2 * margin))
+
+        first_rect = pygame.Rect(
+            area.x + margin,
+            dropdown_rect.bottom + 40,
+            input_width,
+            input_height,
+        )
+        self.first_input.rect = first_rect
+
+        second_rect = pygame.Rect(
+            first_rect.right + spacing,
+            first_rect.y,
+            input_width,
+            input_height,
+        )
+        max_second_width = area.x + area.width - margin - second_rect.x
+        second_rect.width = min(second_rect.width, max_second_width)
+        self.second_input.rect = second_rect
+
+        count_rect = pygame.Rect(
+            area.x + margin,
+            first_rect.bottom + 36,
+            input_width,
+            input_height,
+        )
+        self.count_input.rect = count_rect
+
+        file_rect = pygame.Rect(
+            second_rect.x,
+            count_rect.y,
+            second_rect.width,
+            input_height,
+        )
+        self.filename_input.rect = file_rect
+
+        button_height = self.generate_button.rect.height
+        button_width = min(220, area.width - 2 * margin)
+        button_width = max(160, button_width)
+        button_rect = pygame.Rect(
+            area.x + margin,
+            count_rect.bottom + 40,
+            button_width,
+            button_height,
+        )
+        self.generate_button.rect = button_rect
 
     def _on_param_change(self, label: str):
         self._update_inputs_for_param(label)
@@ -1284,12 +1375,12 @@ class Application:
         self.headless_test = headless_test
         pygame.init()
         if headless_test:
-            flags = pygame.HIDDEN
+            self.window_flags = pygame.HIDDEN
             size = (WINDOW_WIDTH, WINDOW_HEIGHT)
         else:
-            flags = pygame.FULLSCREEN
-            size = (0, 0)
-        self.screen = pygame.display.set_mode(size, flags)
+            self.window_flags = pygame.RESIZABLE
+            size = (WINDOW_WIDTH, WINDOW_HEIGHT)
+        self.screen = pygame.display.set_mode(size, self.window_flags)
         self.window_width, self.window_height = self.screen.get_size()
         pygame.display.set_caption("Bras rigide 1 axe")
         self.clock = pygame.time.Clock()
@@ -1339,6 +1430,7 @@ class Application:
         )
         self.previous_mode = "run"
         self.create_toolbar()
+        self.update_layout()
         self.recompute_trajectory(initial=True, start_after=False)
 
     # ------------------------------------------------------------------
@@ -1368,6 +1460,57 @@ class Application:
             self.set_message(f"Erreur sauvegarde config : {exc}", success=False)
 
     # ------------------------------------------------------------------
+
+    def update_layout(self):
+        min_width = 960
+        min_height = 600
+        if not self.headless_test:
+            self.window_width = max(self.window_width, min_width)
+            self.window_height = max(self.window_height, min_height)
+
+        min_panel_width = 360
+        self.sim_panel_width = int(self.window_width * 0.48)
+        if self.window_width - self.sim_panel_width < min_panel_width:
+            self.sim_panel_width = max(min_panel_width, self.window_width - min_panel_width)
+        self.sim_panel_width = max(min_panel_width, self.sim_panel_width)
+        self.sim_panel_width = min(self.sim_panel_width, max(320, self.window_width - 320))
+        self.plot_panel_width = self.window_width - self.sim_panel_width
+
+        sim_area = pygame.Rect(
+            0,
+            TOOLBAR_HEIGHT,
+            self.sim_panel_width,
+            self.window_height - TOOLBAR_HEIGHT,
+        )
+        self.sim_renderer.area = sim_area
+
+        plot_area = pygame.Rect(
+            self.sim_panel_width,
+            TOOLBAR_HEIGHT,
+            self.plot_panel_width,
+            self.window_height - TOOLBAR_HEIGHT,
+        )
+        self.plot_panel.area = plot_area
+
+        editor_area = pygame.Rect(
+            self.sim_panel_width + 10,
+            TOOLBAR_HEIGHT + 10,
+            max(0, self.plot_panel_width - 20),
+            max(0, self.window_height - TOOLBAR_HEIGHT - 20),
+        )
+        self.editor.resize(editor_area)
+        self.table_panel.resize(editor_area)
+
+    def on_window_resize(self, width: int, height: int):
+        if self.headless_test:
+            return
+        min_width = 960
+        min_height = 600
+        width = max(min_width, width)
+        height = max(min_height, height)
+        self.screen = pygame.display.set_mode((width, height), self.window_flags)
+        self.window_width, self.window_height = self.screen.get_size()
+        self.update_layout()
 
     def create_toolbar(self):
         self.toolbar_buttons.clear()
@@ -1965,6 +2108,9 @@ class Application:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 return False
+            if event.type == pygame.VIDEORESIZE:
+                self.on_window_resize(event.w, event.h)
+                continue
             if event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
                     return False
