@@ -438,6 +438,47 @@ class Button(Widget):
         surface.blit(text_surf, text_surf.get_rect(center=self.rect.center))
 
 
+class WindowControlButton(Button):
+    def __init__(self, rect: pygame.Rect, kind: str, callback: Callable[[], None], font: pygame.font.Font):
+        super().__init__(rect, "", callback, font)
+        self.kind = kind
+
+    def draw(self, surface: pygame.Surface):
+        base_color = HIGHLIGHT_COLOR if self.hover else (70, 74, 96)
+        pygame.draw.rect(surface, base_color, self.rect, border_radius=6)
+        icon_color = (0, 0, 0) if self.hover else TEXT_COLOR
+        if self.kind == "close":
+            pygame.draw.line(
+                surface,
+                icon_color,
+                (self.rect.left + 8, self.rect.top + 8),
+                (self.rect.right - 8, self.rect.bottom - 8),
+                2,
+            )
+            pygame.draw.line(
+                surface,
+                icon_color,
+                (self.rect.left + 8, self.rect.bottom - 8),
+                (self.rect.right - 8, self.rect.top + 8),
+                2,
+            )
+        elif self.kind == "minimize":
+            pygame.draw.line(
+                surface,
+                icon_color,
+                (self.rect.left + 6, self.rect.bottom - 10),
+                (self.rect.right - 6, self.rect.bottom - 10),
+                3,
+            )
+        elif self.kind == "restore":
+            inner = self.rect.inflate(-16, -16)
+            offset_rect = inner.move(4, -4)
+            pygame.draw.rect(surface, icon_color, offset_rect, width=2)
+            pygame.draw.rect(surface, icon_color, inner, width=2)
+        else:  # maximize
+            pygame.draw.rect(surface, icon_color, self.rect.inflate(-12, -12), width=2)
+
+
 class Checkbox(Widget):
     def __init__(self, rect: pygame.Rect, label: str, value: bool, font: pygame.font.Font):
         super().__init__(rect)
@@ -649,6 +690,24 @@ class ParameterEditor:
         for key, widget in self.widgets.items():
             if isinstance(widget, TextInput):
                 widget.text = f"{getattr(self.params, key)}"
+
+    def relayout(self, area: pygame.Rect):
+        stored_texts: Dict[str, str] = {}
+        active_inputs: Dict[str, bool] = {}
+        for key, widget in self.widgets.items():
+            if isinstance(widget, TextInput):
+                stored_texts[key] = widget.text
+                active_inputs[key] = widget.active
+        checkbox_value = self.checkbox.value if hasattr(self, "checkbox") else self.params.gravity_compensation
+        dropdown_value = self.dropdown.value if hasattr(self, "dropdown") else self.params.trajectory_mode
+        self.area = area
+        self._build_widgets()
+        for key, widget in self.widgets.items():
+            if isinstance(widget, TextInput):
+                widget.text = stored_texts.get(key, widget.text)
+                widget.active = active_inputs.get(key, False)
+        self.checkbox.value = checkbox_value
+        self.dropdown.value = dropdown_value
 
     def _on_mode_change(self, new_mode: str):
         previous_mode = self.params.trajectory_mode
@@ -888,6 +947,39 @@ class TableGeneratorPanel:
     def clear_status(self):
         self.status_message = ""
         self.preview_lines = []
+
+    def relayout(self, area: pygame.Rect):
+        self.area = area
+        dropdown_value = self.param_dropdown.value
+        dropdown_open = self.param_dropdown.open
+        input_texts = [inp.text for inp in self.inputs]
+        input_actives = [inp.active for inp in self.inputs]
+        input_width = max(160, (self.area.width - 52) // 2)
+        dropdown_width = max(220, min(self.area.width - 24, 320))
+        dropdown_rect = pygame.Rect(self.area.x + 12, self.area.y + 48, dropdown_width, 32)
+        self.param_dropdown.rect = dropdown_rect
+        self.param_dropdown.open = dropdown_open
+        self.param_dropdown.value = dropdown_value
+        gap = 16
+        first_rect = pygame.Rect(self.area.x + 12, dropdown_rect.bottom + 40, input_width, 32)
+        second_x = first_rect.right + gap
+        if second_x + input_width > self.area.right - 12:
+            second_x = self.area.x + 12
+        second_rect = pygame.Rect(second_x, first_rect.y, input_width, 32)
+        count_rect = pygame.Rect(self.area.x + 12, first_rect.bottom + 36, input_width, 32)
+        file_x = second_rect.x
+        file_rect = pygame.Rect(file_x, count_rect.y, input_width, 32)
+        button_rect = pygame.Rect(self.area.x + 12, count_rect.bottom + 40, 180, 40)
+        for widget, rect, text, active in zip(
+            self.inputs,
+            [first_rect, second_rect, count_rect, file_rect],
+            input_texts,
+            input_actives,
+        ):
+            widget.rect = rect
+            widget.text = text
+            widget.active = active
+        self.generate_button.rect = button_rect
 
     def _on_param_change(self, label: str):
         self._update_inputs_for_param(label)
@@ -1286,15 +1378,19 @@ class Application:
         if headless_test:
             flags = pygame.HIDDEN
             size = (WINDOW_WIDTH, WINDOW_HEIGHT)
+            self.fullscreen = False
         else:
             flags = pygame.FULLSCREEN
             size = (0, 0)
+            self.fullscreen = True
         self.screen = pygame.display.set_mode(size, flags)
         self.window_width, self.window_height = self.screen.get_size()
+        self.windowed_size = (WINDOW_WIDTH, WINDOW_HEIGHT)
         pygame.display.set_caption("Bras rigide 1 axe")
         self.clock = pygame.time.Clock()
         self.font = pygame.font.Font(FONT_NAME, 18)
         self.small_font = pygame.font.Font(FONT_NAME, 14)
+        self.message_color = TEXT_COLOR
         self.params = self.load_params()
         self.simulation = ArmSimulation(self.params)
         self.planner = TrajectoryPlanner(self.params)
@@ -1302,6 +1398,7 @@ class Application:
         self.message = ""
         self.message_time = 0.0
         self.toolbar_buttons: List[Button] = []
+        self.window_control_buttons: List[WindowControlButton] = []
         self.pending_plot_snapshot: Optional[Dict[str, object]] = None
         self.sim_panel_width = int(self.window_width * 0.48)
         self.plot_panel_width = self.window_width - self.sim_panel_width
@@ -1339,6 +1436,7 @@ class Application:
         )
         self.previous_mode = "run"
         self.create_toolbar()
+        self.create_window_controls()
         self.recompute_trajectory(initial=True, start_after=False)
 
     # ------------------------------------------------------------------
@@ -1391,6 +1489,52 @@ class Application:
             rect = pygame.Rect(x, (TOOLBAR_HEIGHT - 40) // 2, 130, 40)
             self.toolbar_buttons.append(Button(rect, label, callback, self.small_font))
             x += rect.width + 8
+
+    def create_window_controls(self):
+        self.window_control_buttons.clear()
+        if self.headless_test:
+            return
+        size = 32
+        padding = 12
+        x = self.window_width - padding - size
+        y = (TOOLBAR_HEIGHT - size) // 2
+        maximize_kind = "restore" if self.fullscreen else "maximize"
+        controls = [
+            ("close", self.on_close_request),
+            (maximize_kind, self.on_toggle_fullscreen),
+            ("minimize", self.on_minimize),
+        ]
+        for kind, callback in controls:
+            rect = pygame.Rect(x, y, size, size)
+            self.window_control_buttons.append(WindowControlButton(rect, kind, callback, self.small_font))
+            x -= size + 8
+
+    def update_layout(self):
+        self.window_width, self.window_height = self.screen.get_size()
+        self.sim_panel_width = int(self.window_width * 0.48)
+        self.plot_panel_width = self.window_width - self.sim_panel_width
+        self.sim_renderer.area = pygame.Rect(
+            0,
+            TOOLBAR_HEIGHT,
+            self.sim_panel_width,
+            self.window_height - TOOLBAR_HEIGHT,
+        )
+        self.plot_panel.area = pygame.Rect(
+            self.sim_panel_width,
+            TOOLBAR_HEIGHT,
+            self.plot_panel_width,
+            self.window_height - TOOLBAR_HEIGHT,
+        )
+        editor_area = pygame.Rect(
+            self.sim_panel_width + 10,
+            TOOLBAR_HEIGHT + 10,
+            self.plot_panel_width - 20,
+            self.window_height - TOOLBAR_HEIGHT - 20,
+        )
+        self.editor.relayout(editor_area)
+        self.table_panel.relayout(editor_area)
+        self.create_toolbar()
+        self.create_window_controls()
 
     def toggle_mode(self):
         if self.mode == "table":
@@ -1458,6 +1602,29 @@ class Application:
         self.simulation.paused = True
         self.table_panel.sync_params(self.params)
         self.set_message("Mode tableau actif", success=True)
+
+    def on_close_request(self):
+        pygame.event.post(pygame.event.Event(pygame.QUIT))
+
+    def on_minimize(self):
+        if self.headless_test:
+            return
+        pygame.display.iconify()
+        self.set_message("Fenêtre minimisée", success=True)
+
+    def on_toggle_fullscreen(self):
+        if self.headless_test:
+            return
+        if self.fullscreen:
+            self.fullscreen = False
+            self.screen = pygame.display.set_mode(self.windowed_size, pygame.RESIZABLE)
+            self.set_message("Mode fenêtre", success=True)
+        else:
+            self.windowed_size = self.screen.get_size()
+            self.fullscreen = True
+            self.screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
+            self.set_message("Mode plein écran", success=True)
+        self.update_layout()
 
     def on_launch(self):
         try:
@@ -1965,6 +2132,11 @@ class Application:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 return False
+            if event.type == pygame.VIDEORESIZE and not self.fullscreen:
+                self.screen = pygame.display.set_mode((event.w, event.h), pygame.RESIZABLE)
+                self.windowed_size = (event.w, event.h)
+                self.update_layout()
+                continue
             if event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
                     return False
@@ -1975,6 +2147,8 @@ class Application:
                 elif event.key == pygame.K_p:
                     self.on_pause()
             for button in self.toolbar_buttons:
+                button.handle_event(event)
+            for button in self.window_control_buttons:
                 button.handle_event(event)
             if self.mode == "edit":
                 if self.editor.has_open_dropdown():
@@ -1994,12 +2168,19 @@ class Application:
         pygame.draw.rect(self.screen, TOOLBAR_BG, pygame.Rect(0, 0, self.window_width, TOOLBAR_HEIGHT))
         for button in self.toolbar_buttons:
             button.draw(self.screen)
+        for button in self.window_control_buttons:
+            button.draw(self.screen)
         if self.message:
             if time.time() - self.message_time > 4.0:
                 self.message = ""
             else:
                 text = self.small_font.render(self.message, True, self.message_color)
-                self.screen.blit(text, (self.window_width - text.get_width() - 20, 20))
+                control_left = min((btn.rect.x for btn in self.window_control_buttons), default=self.window_width)
+                max_x = self.window_width - text.get_width() - 20
+                if self.window_control_buttons:
+                    max_x = min(max_x, control_left - text.get_width() - 12)
+                x = max(20, max_x)
+                self.screen.blit(text, (x, 20))
 
     def draw_dropdown_modals(self):
         if self.mode == "edit":
